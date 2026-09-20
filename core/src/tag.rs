@@ -188,14 +188,19 @@ pub fn read_from_file(path: impl AsRef<Path>) -> Result<(MediaMetadata, Option<V
             .collect();
     }
 
-    // Cast / directors from the iTunMOVI plist, if present.
+    // Cast / crew from the iTunMOVI plist, if present.
     if let Some(Data::Utf8(xml)) = tag
         .data_of(&DataIdent::freeform(ITUNMOVI_MEAN, ITUNMOVI_NAME))
         .next()
     {
-        let (cast, directors) = parse_itunmovi_people(xml);
-        meta.cast = cast;
-        meta.directors = directors;
+        let people = parse_itunmovi_people(xml);
+        meta.cast = people.cast;
+        meta.directors = people.directors;
+        meta.producers = people.producers;
+        meta.writers = people.writers;
+        if meta.studio.is_none() {
+            meta.studio = people.studio;
+        }
     }
 
     let cover = tag.artwork().map(|img| img.data.to_vec());
@@ -203,10 +208,22 @@ pub fn read_from_file(path: impl AsRef<Path>) -> Result<(MediaMetadata, Option<V
     Ok((meta, cover))
 }
 
-/// Extract `<key>cast</key>` and `<key>directors</key>` name arrays from an
-/// `iTunMOVI` plist. Intentionally lightweight (no full plist parser): scans
-/// for the relevant `<array>` blocks and pulls `<string>` names.
-fn parse_itunmovi_people(xml: &str) -> (Vec<Person>, Vec<Person>) {
+/// The people/credits parsed back out of an `iTunMOVI` plist.
+#[derive(Default)]
+struct ItunmoviPeople {
+    cast: Vec<Person>,
+    directors: Vec<Person>,
+    producers: Vec<Person>,
+    writers: Vec<Person>,
+    studio: Option<String>,
+}
+
+/// Extract the cast/directors/producers/screenwriters name arrays and the
+/// studio string from an `iTunMOVI` plist. Intentionally lightweight (no full
+/// plist parser): scans for each key's `<array>` (or `<string>`) block and
+/// pulls the `<string>` values.
+fn parse_itunmovi_people(xml: &str) -> ItunmoviPeople {
+    // Names inside the `<array>` that follows `<key>{key}</key>`.
     fn names_after_key(xml: &str, key: &str) -> Vec<Person> {
         let key_tag = format!("<key>{key}</key>");
         let Some(kpos) = xml.find(&key_tag) else {
@@ -234,10 +251,29 @@ fn parse_itunmovi_people(xml: &str) -> (Vec<Person>, Vec<Person>) {
         }
         people
     }
-    (
-        names_after_key(xml, "cast"),
-        names_after_key(xml, "directors"),
-    )
+
+    // The single `<string>` value that follows `<key>{key}</key>`.
+    fn string_after_key(xml: &str, key: &str) -> Option<String> {
+        let key_tag = format!("<key>{key}</key>");
+        let kpos = xml.find(&key_tag)?;
+        let rest = &xml[kpos + key_tag.len()..];
+        let sstart = rest.find("<string>")? + "<string>".len();
+        let send = rest[sstart..].find("</string>")?;
+        let val = xml_unescape(rest[sstart..sstart + send].trim());
+        if val.is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    }
+
+    ItunmoviPeople {
+        cast: names_after_key(xml, "cast"),
+        directors: names_after_key(xml, "directors"),
+        producers: names_after_key(xml, "producers"),
+        writers: names_after_key(xml, "screenwriters"),
+        studio: string_after_key(xml, "studio"),
+    }
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -252,56 +288,86 @@ pub fn write_to_file(
     path: impl AsRef<Path>,
     meta: &MediaMetadata,
     artwork: Option<&EncodedArtwork>,
+    fast_start: bool,
 ) -> Result<()> {
-    write_to_file_with_progress(path, meta, artwork, &mut |_, _| {})
+    write_to_file_with_progress(path, meta, artwork, fast_start, &mut |_, _| {})
 }
 
-/// Write metadata, choosing the strategy from the file's layout:
+/// Write metadata, producing the layout requested by `fast_start`:
 ///
-/// - If `moov` is already after `mdat`, edit **in place** (mp4ameta) — a cheap
-///   tail edit that never moves the media.
-/// - If `moov` precedes `mdat` (so growing the tag would shift the media), do a
-///   safe rewrite: stream-copy the original to a sibling temp file (reporting
-///   progress), let mp4ameta perform the edit (including any `mdat` shift and
-///   offset fixups) on that temp copy, then **atomically rename** it over the
-///   original. The original is never modified until the finished temp is
-///   swapped in, so a crash can't corrupt it.
+/// - `fast_start == false` (moov-last): if the file is already moov-last, edit
+///   **in place** (mp4ameta) — a cheap tail edit that never moves the media.
+///   Otherwise rewrite the media on a temp copy so `moov` ends up **after**
+///   `mdat`, then atomic-swap.
+/// - `fast_start == true` (web-optimized / moov-first): rewrite on a temp copy
+///   so the final layout is `[ftyp][moov][free padding][mdat]`, patching the
+///   `stco`/`co64` chunk-offset tables for the moved `mdat`, then atomic-swap.
+///
+/// In both rewrite cases the work is done on a sibling temp file and the
+/// requested layout normalization is applied as a post-pass, so the on-disk
+/// result matches the requested layout regardless of how mp4ameta placed the
+/// boxes during its edit. The original is never modified until the finished
+/// temp is swapped in, so a crash can't corrupt it. Progress is reported as
+/// `(bytes_done, bytes_total)` during the streaming copies.
 pub fn write_to_file_with_progress(
     path: impl AsRef<Path>,
     meta: &MediaMetadata,
     artwork: Option<&EncodedArtwork>,
+    fast_start: bool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<()> {
     let path = path.as_ref();
 
-    let must_shift = crate::mp4rewrite::moov_precedes_mdat(path).unwrap_or(false);
+    let currently_fast = crate::mp4rewrite::is_fast_start(path).unwrap_or(false);
 
-    if !must_shift {
-        // Fast path: in-place tail edit (mp4ameta won't move the media).
+    // Cheap path: the file is already in the layout the caller wants. mp4ameta
+    // edits `moov` in place without ever reordering top-level boxes, so the
+    // layout (moov-first or moov-last) is preserved:
+    //   - moov-last stays moov-last: a trailing edit that doesn't move media.
+    //   - moov-first stays moov-first: mp4ameta fixes up chunk offsets itself,
+    //     and when the metadata is unchanged the tag size is identical so
+    //     nothing shifts at all.
+    // Either way, no full rewrite is needed.
+    if fast_start == currently_fast {
         apply_tag_in_place(path, meta, artwork)?;
         return Ok(());
     }
 
-    // Shift path: work on a sibling temp copy, then atomic-swap.
+    // Layout change requested (fast-start toggled). Rewrite on a sibling temp
+    // copy, then atomic-swap. We run the requested layout normalization as a
+    // post-pass so the on-disk result matches the requested layout regardless
+    // of how mp4ameta placed the boxes during its edit.
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("tagtiger");
     let tmp = dir.join(format!(".{stem}.tagtiger.tmp"));
+    let tmp2 = dir.join(format!(".{stem}.tagtiger.tmp2"));
 
     let result = (|| -> Result<()> {
-        // 1) Stream-copy original -> temp, reporting progress.
+        // 1) Copy original -> temp so mp4ameta never touches the original.
         crate::mp4rewrite::copy_file_with_progress(path, &tmp, progress)?;
-        // 2) Let mp4ameta perform the edit (and any offset fixups) on the temp.
+        // 2) Let mp4ameta perform the tag edit on the temp.
         apply_tag_in_place(&tmp, meta, artwork)?;
-        // 3) Atomically replace the original with the finished temp file.
+        // 3) Normalize the temp into the requested layout (tmp -> tmp2), then
+        //    swap tmp2 in as the finished temp.
+        let normalized = if fast_start {
+            crate::mp4rewrite::normalize_moov_first(&tmp, &tmp2, progress)?
+        } else {
+            crate::mp4rewrite::normalize_moov_last(&tmp, &tmp2, progress)?
+        };
+        if normalized {
+            std::fs::rename(&tmp2, &tmp)?;
+        }
+        // 4) Atomically replace the original with the finished temp file.
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
 
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp2);
     }
     result
 }
@@ -513,11 +579,14 @@ mod tests {
     fn parses_itunmovi_people_roundtrip() {
         let meta = sample_movie();
         let xml = build_itunmovi_plist(&meta).unwrap();
-        let (cast, directors) = parse_itunmovi_people(&xml);
-        let cast_names: Vec<_> = cast.iter().map(|p| p.name.as_str()).collect();
-        let dir_names: Vec<_> = directors.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(cast_names, vec!["Keanu Reeves", "Carrie-Anne Moss"]);
-        assert_eq!(dir_names, vec!["Lana Wachowski"]);
+        let people = parse_itunmovi_people(&xml);
+        let names = |v: &[Person]| v.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&people.cast), vec!["Keanu Reeves", "Carrie-Anne Moss"]);
+        assert_eq!(names(&people.directors), vec!["Lana Wachowski"]);
+        // These two were previously dropped on read — the bug this fixes.
+        assert_eq!(names(&people.producers), vec!["Joel Silver"]);
+        assert_eq!(names(&people.writers), vec!["Lilly Wachowski"]);
+        assert_eq!(people.studio.as_deref(), Some("Warner Bros."));
     }
 
     #[test]
@@ -526,8 +595,8 @@ mod tests {
         meta.cast = vec![Person::new("A & B <tag>")];
         meta.directors = vec![];
         let xml = build_itunmovi_plist(&meta).unwrap();
-        let (cast, _) = parse_itunmovi_people(&xml);
-        assert_eq!(cast[0].name, "A & B <tag>");
+        let people = parse_itunmovi_people(&xml);
+        assert_eq!(people.cast[0].name, "A & B <tag>");
     }
 
     #[test]

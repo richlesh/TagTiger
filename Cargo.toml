@@ -3,7 +3,7 @@ resolver = "2"
 members = ["core", "cli", "gui"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
@@ -34,6 +34,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 
 # Platform paths
 dirs = "7"
+
+# License-key HMAC validation
+hmac = "0.12"
+sha2 = "0.10"
 
 # Internal
 tagtiger-core = { path = "core" }

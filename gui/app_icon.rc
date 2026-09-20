@@ -1,0 +1,3 @@
+// Windows resource script: associates the application icon with the executable.
+// The first icon (lowest ID) becomes the executable's default icon.
+IDI_ICON1 ICON "src/resources/app_icon.ico"

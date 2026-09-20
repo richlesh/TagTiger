@@ -1,0 +1,5 @@
+# Configuration for `cross` (used for the aarch64 Linux release build).
+# Forward the license salt into the build container so gui/build.rs can
+# generate the git-ignored gui/src/license.rs at compile time.
+[build.env]
+passthrough = ["LICENSE_SALT"]

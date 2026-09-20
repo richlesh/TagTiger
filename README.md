@@ -1,20 +1,26 @@
 # TagTiger
 
 Cross-platform MP4/M4V metadata tagger. Looks up movie (and, later, TV episode)
-metadata and posters from TMDB and writes Apple/iTunes-style atoms
-(`©nam`, `©day`, `desc`/`ldes`, `covr`, `stik`, the `iTunMOVI` cast/director
-plist, and TV atoms) directly into the file.
+metadata and posters from TMDB and writes Apple/iTunes-style atoms directly into
+the file — title, release date, short/long description, genres, content rating,
+media kind, HD/4K definition, studio, the `iTunMOVI` cast/director/producer/
+screenwriter plist, cover art, and TV atoms.
 
 Written in Rust. No external command-line tools are required at runtime — MP4
 atom writing is done in-process via the pure-Rust `mp4ameta` crate. It ships as
 a single native binary per platform (Linux, macOS, Windows on x86-64 and ARM64).
+
+The desktop GUI is a full metadata editor: search TMDB, pick from a poster grid,
+edit every field (with per-field locks, undo/redo, and paste/drop of custom
+poster art), choose the video definition, and toggle a **fast-start**
+(web-optimized) layout on save.
 
 ## Workspace layout
 
 ```
 core/   library — domain model, MP4 atom tagging, providers, naming, artwork
 cli/    thin command-line frontend (binary: tagtiger)
-gui/    egui desktop app (binary: tagtiger-gui) with a poster-selection grid
+gui/    egui desktop app (binary: tagtiger-gui): metadata editor + poster grid
 ```
 
 The design keeps concerns decoupled:
@@ -64,9 +70,38 @@ the Bearer token takes precedence.
 
 ```sh
 tagtiger search  "The Matrix (1999).mp4"      # parse name + list TMDB matches
-tagtiger inspect movie.m4v                     # show existing tags
+tagtiger inspect movie.m4v                     # show existing tags (all fields)
 tagtiger tag     "The Matrix (1999).mp4" --id 603   # fetch + write tags (+poster)
 ```
+
+`inspect` prints the full set of tags read back from the file — title, release
+date, media kind, definition, rating, genres, studio, directors, cast,
+producers, screenwriters, summary, long description, and whether cover art is
+present. `tag` preserves the file's existing fast-start layout and, when TMDB
+doesn't supply a definition, deduces it from the video track's dimensions.
+
+## Usage (GUI)
+
+```sh
+cargo run -p tagtiger-gui          # or run the packaged binary
+```
+
+The GUI is a full editor. Open an MP4/M4V (File ▸ Open…, drag-and-drop, or an
+"Open With" launch), search TMDB, and pick a poster from the grid. Every field
+is editable with a per-field **Lock** (locked fields aren't overwritten when you
+select a different match), and edits support **undo/redo**. Poster art can be
+selected, copied/cut, and replaced by pasting or dropping an image; a
+**Fast-start** checkbox controls whether the file is saved web-optimized
+(`moov` before `mdat`) or with `moov` last. The window/dock/taskbar icon and, on
+macOS/Windows, the executable and installer icons are bundled.
+
+### License
+
+TagTiger is donationware. Enter a license key via **Help ▸ License Key…** (email
++ key); it's validated and saved to `~/.tagtiger-settings.json`. A valid license
+suppresses the startup splash and shows a thank-you in **Help ▸ About**.
+Unlicensed use shows the splash on startup and again every 10 tag-write
+operations.
 
 ## Metadata written
 
@@ -76,8 +111,11 @@ tagtiger tag     "The Matrix (1999).mp4" --id 603   # fetch + write tags (+poste
 | Release date  | `©day`                                        |
 | Description   | `desc` (short) + `ldes` (long)                |
 | Genres        | `©gen`                                        |
+| Content rating| `iTunEXTC` (e.g. `mpaa|PG-13|300|`)           |
 | Media kind    | `stik` (Movie=9 / TV Show=10)                 |
-| Cast/crew     | `iTunMOVI` plist inside `----`/`com.apple.iTunes` |
+| Definition    | `hdvd` (SD=0 / 720p=1 / 1080p=2 / 4K=3)       |
+| Studio        | `©pub` and `iTunMOVI` `studio`                |
+| Cast/crew     | `iTunMOVI` plist inside `----`/`com.apple.iTunes` (cast, directors, producers, screenwriters) |
 | Poster        | `covr` (JPEG/PNG)                             |
 | TV (later)    | `tvsh`, `tvnn`, `tvsn`, `tves`, `tven`        |
 
@@ -94,10 +132,29 @@ CI builds six targets and publishes them on tagged releases (`vX.Y.Z`):
 Linux releases include `.deb` and `.rpm` packages in addition to a `.tar.gz`.
 A single Linux binary per architecture runs on both Debian- and Red Hat-family
 distributions; the `-gnu` builds are produced on an older Ubuntu image to keep
-the glibc requirement low. macOS ships `.tar.gz`, Windows ships `.zip`.
+the glibc requirement low. macOS ships a `.app` bundle inside a `.dmg` (whose
+mounted volume shows the app icon) plus a `.tar.gz`; Windows ships a `.zip`.
 
-> macOS note: distributed binaries should be codesigned and notarized for
-> Gatekeeper. That step is not yet wired into CI.
+Releases are cut from the **Release** workflow: run it manually with a version
+(the tag is created and pushed for you) or push a `vX.Y.Z` tag directly.
+
+### Code signing
+
+Code signing is wired into the release workflow and activates when the relevant
+secrets are configured (builds are produced unsigned otherwise):
+
+- **macOS** — the `.app` and `.dmg` are codesigned with a Developer ID
+  Application certificate (hardened runtime + `packaging/entitlements.plist`),
+  then notarized with `notarytool` and stapled. Secrets: `APPLE_CERTIFICATE_BASE64`,
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`,
+  `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`.
+- **Windows** — the executables are signed via Azure Trusted Signing. Secrets:
+  `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+  `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT_NAME`,
+  `AZURE_SIGNING_CERTIFICATE_PROFILE_NAME`.
+
+The GUI's license salt lives in the git-ignored `gui/src/license.rs`; CI
+generates it from the `LICENSE_SALT` secret when the file is absent.
 
 ## License
 

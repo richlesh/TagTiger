@@ -29,6 +29,7 @@ struct Snapshot {
     directors: String,
     producers: String,
     writers: String,
+    studio: String,
     /// Encoded bytes of the current cover, if any.
     cover_bytes: Option<Vec<u8>>,
     cover_size: Option<(u32, u32)>,
@@ -90,6 +91,7 @@ pub struct App {
     edit_directors: String,
     edit_producers: String,
     edit_writers: String,
+    edit_studio: String,
 
     // Per-field locks: when set, the field is read-only and is not overwritten
     // when a new match's details load.
@@ -103,6 +105,7 @@ pub struct App {
     lock_directors: bool,
     lock_producers: bool,
     lock_writers: bool,
+    lock_studio: bool,
     /// Lock for the poster/cover: when set, selecting a match won't change the
     /// chosen poster and a pasted/dropped image is ignored.
     lock_poster: bool,
@@ -121,6 +124,9 @@ pub struct App {
     /// Selected media/video kind (`stik`) and its lock.
     edit_video_kind: Option<VideoKind>,
     lock_video_kind: bool,
+    /// Whether to save the file as fast-start (moov-first). Initialized from
+    /// the opened file's current layout; the user can toggle it.
+    edit_fast_start: bool,
     /// Selected video definition (`hdvd`) and its lock.
     edit_definition: Option<Definition>,
     lock_definition: bool,
@@ -132,12 +138,46 @@ pub struct App {
     write_done_msg: Option<String>,
     /// True while the current save is a shift/rewrite (vs in-place).
     write_is_shift: bool,
+    /// True from when the user clicks "Write tags" until the write completes
+    /// (or errors). Disables the button so a write can't be launched twice.
+    writing: bool,
+
+    /// The app icon texture (96×96), lazily created for the About/Splash
+    /// dialogs. `None` until first shown.
+    icon_tex: Option<egui::TextureHandle>,
+    /// True while the About dialog is open.
+    about_open: bool,
+    /// When the splash screen should stop showing. `Some(instant)` while the
+    /// splash is visible on startup; cleared when it closes (after 20s or on
+    /// click).
+    splash_until: Option<std::time::Instant>,
+
+    /// Persisted settings (license + tag counter), loaded at startup.
+    settings: crate::license_mgr::Settings,
+    /// True while the License Key dialog is open.
+    license_open: bool,
+    /// Email input in the License Key dialog.
+    license_email_input: String,
+    /// License-key input in the License Key dialog (may contain dashes).
+    license_key_input: String,
+    /// Transient status message shown in the License Key dialog.
+    license_msg: String,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let worker = Worker::spawn(move || ctx.request_repaint());
+
+        // Load persisted settings. When a valid license is present the startup
+        // splash is suppressed; otherwise it shows for 20 seconds.
+        let settings = crate::license_mgr::Settings::load();
+        let splash_until = if settings.is_licensed() {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(20))
+        };
+
         let app = Self {
             worker,
             file: None,
@@ -167,6 +207,7 @@ impl App {
             edit_directors: String::new(),
             edit_producers: String::new(),
             edit_writers: String::new(),
+            edit_studio: String::new(),
             lock_title: false,
             lock_year: false,
             lock_rating: false,
@@ -177,6 +218,7 @@ impl App {
             lock_directors: false,
             lock_producers: false,
             lock_writers: false,
+            lock_studio: false,
             lock_poster: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -184,12 +226,23 @@ impl App {
             last_text_focus: None,
             edit_video_kind: None,
             lock_video_kind: false,
+            edit_fast_start: false,
             edit_definition: None,
             lock_definition: false,
             video_dimensions: None,
             write_progress: None,
             write_done_msg: None,
             write_is_shift: false,
+            writing: false,
+            icon_tex: None,
+            about_open: false,
+            // Suppressed at startup when licensed (computed above).
+            splash_until,
+            settings,
+            license_open: false,
+            license_email_input: String::new(),
+            license_key_input: String::new(),
+            license_msg: String::new(),
         };
 
         // If launched with a movie file argument (e.g. Finder "Open With" or
@@ -214,6 +267,7 @@ impl App {
                     cover_size,
                     cover_bytes,
                     video_dimensions,
+                    fast_start,
                 } => {
                     self.file = Some(file);
                     self.file_loaded = true;
@@ -223,6 +277,7 @@ impl App {
                     self.cover_bytes = cover_bytes;
                     self.cover_size = cover_size;
                     self.video_dimensions = video_dimensions;
+                    self.edit_fast_start = fast_start;
                     self.poster_selected = false;
                     // Fresh file: reset undo history.
                     self.undo_stack.clear();
@@ -310,6 +365,7 @@ impl App {
                 }
                 Event::WriteDone { file } => {
                     self.write_progress = None;
+                    self.writing = false;
                     let name = file
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -323,6 +379,17 @@ impl App {
                     self.write_done_msg = Some(format!("“{name}” was {how}."));
                     self.status = format!("Saved: {name}");
                     self.write_is_shift = false;
+
+                    // Count each successful tag-write and persist it. For
+                    // unlicensed users, show the donation splash for 20s every
+                    // 10th write. Licensed users are never nagged.
+                    self.settings.tag_count = self.settings.tag_count.wrapping_add(1);
+                    let _ = self.settings.save();
+                    if !self.settings.is_licensed() && self.settings.tag_count % 10 == 0 {
+                        self.splash_until = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(20),
+                        );
+                    }
                 }
                 Event::WriteStarted => {
                     self.write_progress = Some((0, 0));
@@ -336,6 +403,7 @@ impl App {
                     self.loading_details = false;
                     self.write_progress = None;
                     self.write_is_shift = false;
+                    self.writing = false;
                     self.status = format!("Error: {e}");
                 }
             }
@@ -357,6 +425,7 @@ impl App {
             directors: self.edit_directors.clone(),
             producers: self.edit_producers.clone(),
             writers: self.edit_writers.clone(),
+            studio: self.edit_studio.clone(),
             cover_bytes: self.cover_bytes.clone(),
             cover_size: self.cover_size,
         }
@@ -417,6 +486,7 @@ impl App {
         self.edit_directors = s.directors;
         self.edit_producers = s.producers;
         self.edit_writers = s.writers;
+        self.edit_studio = s.studio;
         self.cover_size = s.cover_size;
         self.set_cover_bytes(ctx, s.cover_bytes);
     }
@@ -514,6 +584,25 @@ impl App {
         self.status = "Poster cut.".into();
     }
 
+    /// Delete the current poster without touching the clipboard (undoable).
+    /// Used by the Delete/Backspace key when the poster is selected.
+    fn delete_poster(&mut self, ctx: &egui::Context) {
+        if self.cover_bytes.is_none() {
+            self.status = "No poster to delete.".into();
+            return;
+        }
+        if self.lock_poster {
+            self.status = "Poster is locked.".into();
+            return;
+        }
+        let before = self.snapshot();
+        self.push_undo(before);
+        self.set_cover_bytes(ctx, None);
+        self.cover_size = None;
+        self.poster_selected = false;
+        self.status = "Poster deleted.".into();
+    }
+
     /// Paste an image from the clipboard as the current poster (undoable).
     fn paste_poster(&mut self, ctx: &egui::Context) {
         if self.lock_poster {
@@ -600,6 +689,9 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(", ");
         }
+        if !(respect_locks && self.lock_studio) {
+            self.edit_studio = meta.studio.clone().unwrap_or_default();
+        }
 
         self.thumbs = vec![None; meta.artwork.len()];
         self.thumb_requested = vec![false; meta.artwork.len()];
@@ -655,6 +747,11 @@ impl App {
             .into_iter()
             .map(Person::new)
             .collect();
+        m.studio = if self.edit_studio.trim().is_empty() {
+            None
+        } else {
+            Some(self.edit_studio.trim().to_string())
+        };
         Some(m)
     }
 }
@@ -790,7 +887,7 @@ impl eframe::App for App {
         self.handle_image_input(&ctx);
 
         // Global keyboard shortcuts for edit actions.
-        let (do_undo, do_redo, do_cut, do_copy) = ctx.input(|i| {
+        let (do_undo, do_redo, do_cut, do_copy, do_delete) = ctx.input(|i| {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             let shift = i.modifiers.shift;
             (
@@ -798,6 +895,7 @@ impl eframe::App for App {
                 cmd && ((shift && i.key_pressed(egui::Key::Z)) || i.key_pressed(egui::Key::Y)),
                 cmd && i.key_pressed(egui::Key::X),
                 cmd && i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
             )
         });
         if do_undo {
@@ -813,9 +911,26 @@ impl eframe::App for App {
         if do_copy && self.poster_selected {
             self.copy_poster();
         }
+        // Delete/Backspace removes the poster when it's the selected element
+        // and no text field has focus (so it won't disrupt text editing).
+        if do_delete && self.poster_selected && live_focus.is_none() {
+            self.delete_poster(&ctx);
+        }
 
         egui::Panel::top("menubar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open…").clicked() {
+                        self.status = "Choose a file…".into();
+                        let _ = self.worker.tx.send(Request::PickFile);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.close();
+                    }
+                });
                 ui.menu_button("Edit", |ui| {
                     let can_undo = !self.undo_stack.is_empty() || self.text_edit_pending.is_some();
                     let can_redo = !self.redo_stack.is_empty();
@@ -861,6 +976,17 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.menu_paste(&ctx, menu_focus);
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("License Key…").clicked() {
+                        self.open_license_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("About TagTiger").clicked() {
+                        self.about_open = true;
                         ui.close();
                     }
                 });
@@ -1017,6 +1143,12 @@ impl eframe::App for App {
                                         });
                                 });
                                 ui.checkbox(&mut self.lock_video_kind, "Lock");
+                                ui.checkbox(&mut self.edit_fast_start, "Fast-start")
+                                    .on_hover_text(
+                                        "When checked, save a web-optimized file with moov \
+                                         before mdat. When unchecked, moov is placed after \
+                                         mdat.",
+                                    );
                             });
                             // Definition: SD / HD 720p / HD 1080p / 4K.
                             ui.horizontal(|ui| {
@@ -1166,6 +1298,16 @@ impl eframe::App for App {
                             f_gained |= r.gained_focus();
                             f_lost |= r.lost_focus();
                             f_changed |= r.changed();
+                            let r = field_row(
+                                ui,
+                                "Studio",
+                                &mut self.edit_studio,
+                                &mut self.lock_studio,
+                                LABEL_W,
+                            );
+                            f_gained |= r.gained_focus();
+                            f_lost |= r.lost_focus();
+                            f_changed |= r.changed();
 
                             // Summary: 2-line input, 255-character limit.
                             ui.horizontal(|ui| {
@@ -1286,7 +1428,10 @@ impl eframe::App for App {
                 }
 
                 ui.separator();
-                if ui.button("Write tags").clicked() {
+                if ui
+                    .add_enabled(!self.writing, egui::Button::new("Write tags"))
+                    .clicked()
+                {
                     self.write_tags();
                 }
 
@@ -1344,6 +1489,12 @@ impl eframe::App for App {
                     });
                 });
         }
+
+        // About dialog (Help ▸ About) and the startup splash. Rendered last so
+        // they sit on top of everything else.
+        self.about_window(&ctx);
+        self.license_window(&ctx);
+        self.splash_window(&ctx);
     }
 }
 
@@ -1591,18 +1742,347 @@ impl App {
     }
 
     fn write_tags(&mut self) {
+        // Guard against re-entry (e.g. Enter key) while a write is in flight.
+        if self.writing {
+            return;
+        }
         let (Some(file), Some(meta)) = (self.file.clone(), self.collect_edited()) else {
             self.status = "Nothing to write.".into();
             return;
         };
         let cover_override = self.cover_bytes.clone();
+        // Mark as in-flight so the button is disabled until WriteDone/Error.
+        self.writing = true;
         self.status = "Writing…".into();
         let _ = self.worker.tx.send(Request::WriteTags {
             file,
             meta: Box::new(meta),
             artwork_url: None,
             cover_override,
+            fast_start: self.edit_fast_start,
         });
+    }
+
+    /// Lazily create the 96×96 app-icon texture used by the About/Splash
+    /// dialogs, decoding the embedded PNG on first use.
+    fn ensure_icon(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.icon_tex.is_none() {
+            let bytes = include_bytes!("resources/app_icon_256.png");
+            if let Ok(img) = image::load_from_memory(bytes) {
+                let img = img.to_rgba8();
+                let (w, h) = img.dimensions();
+                let color =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
+                self.icon_tex =
+                    Some(ctx.load_texture("app_icon", color, egui::TextureOptions::LINEAR));
+            }
+        }
+        self.icon_tex.clone()
+    }
+
+    /// The About dialog — a native rendering of RenameCheetah's `about.html`:
+    /// dark panel, rounded 96px icon, title, version/copyright/build lines,
+    /// links, and an OK button.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let icon = self.ensure_icon(ctx);
+        let mut open = true;
+        egui::Window::new("About TagTiger")
+            .id(egui::Id::new("about"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    if let Some(tex) = &icon {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(96.0, 96.0))
+                                .corner_radius(20.0),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(title_text("TagTiger"));
+                    ui.add_space(6.0);
+                    ui.label(muted_text(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    ui.label(muted_text("©2026 Richard Lesh"));
+                    ui.label(muted_text(&format!("Built with egui v{EGUI_VERSION}")));
+                    ui.add_space(2.0);
+                    ui.hyperlink_to("Glowing Cat Software", GLOWING_CAT_URL);
+                    ui.hyperlink_to("Report issues on GitHub", ISSUES_URL);
+                    ui.add_space(12.0);
+                    if ui.button("OK").clicked() {
+                        self.about_open = false;
+                    }
+                    // Donation thank-you shown only for licensed users.
+                    if self.settings.is_licensed() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Thank you for donating to")
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)),
+                        );
+                        ui.label(
+                            egui::RichText::new("Glowing Cat Software!")
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                });
+            });
+        // Close via the window's X button or Escape.
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.about_open = false;
+        }
+    }
+
+    /// The startup splash — a native rendering of RenameCheetah's `splash.html`:
+    /// dark panel, icon, title, version, and a donate message with a link.
+    /// Auto-closes after 20 seconds; also closes on a click anywhere except the
+    /// donate link.
+    fn splash_window(&mut self, ctx: &egui::Context) {
+        let Some(until) = self.splash_until else {
+            return;
+        };
+        // Auto-close after the timeout.
+        if std::time::Instant::now() >= until {
+            self.splash_until = None;
+            return;
+        }
+        // Keep repainting so the timeout fires even without user input.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
+        let icon = self.ensure_icon(ctx);
+        let mut link_clicked = false;
+        egui::Window::new("TagTiger")
+            .id(egui::Id::new("splash"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(12.0);
+                    if let Some(tex) = &icon {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(96.0, 96.0))
+                                .corner_radius(20.0),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(title_text("TagTiger"));
+                    ui.add_space(4.0);
+                    ui.label(muted_text(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    ui.add_space(8.0);
+                    ui.label(body_text("If you enjoy using this product"));
+                    ui.label(body_text("please consider donating to help"));
+                    ui.label(body_text("fund this and other open source"));
+                    ui.horizontal(|ui| {
+                        // Center the "projects at <link>." line.
+                        ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
+                        ui.label(body_text("projects at"));
+                        if ui.link("Glowing Cat Software").clicked() {
+                            link_clicked = true;
+                            let _ = webbrowser_open(GLOWING_CAT_URL);
+                        }
+                        ui.label(body_text("."));
+                    });
+                    ui.add_space(12.0);
+                });
+            });
+
+        // Close on a click anywhere except the donate link.
+        let clicked_anywhere = ctx.input(|i| i.pointer.any_click());
+        if clicked_anywhere && !link_clicked {
+            self.splash_until = None;
+        }
+    }
+
+    /// The License Key dialog — a native rendering of RenameCheetah's
+    /// `license_dialog.html`: email + key inputs with live validation, a donate
+    /// link, and Cancel/Save. Save is enabled only when the key is valid for
+    /// the entered email; saving persists the license to settings.
+    fn license_window(&mut self, ctx: &egui::Context) {
+        if !self.license_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        let mut do_cancel = false;
+
+        egui::Window::new("License Key")
+            .id(egui::Id::new("license"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(title_text("License Key"));
+                    ui.add_space(4.0);
+                    ui.label(muted_text("Enter your email address and license key"));
+                    ui.add_space(8.0);
+                });
+
+                // Email input.
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.license_email_input)
+                        .hint_text("Your email address")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+
+                // Key input: reformat to XXXX-XXXX-XXXX-XXXX as the user types.
+                let key_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.license_key_input)
+                        .hint_text("XXXX-XXXX-XXXX-XXXX")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+                if key_resp.changed() {
+                    self.license_key_input =
+                        crate::license_mgr::format_key(&self.license_key_input);
+                }
+
+                let valid = crate::license_mgr::is_valid(
+                    &self.license_key_input,
+                    &self.license_email_input,
+                );
+
+                ui.add_space(8.0);
+                ui.hyperlink_to(
+                    "Donate at Glowing Cat Software to get a license key.",
+                    GLOWING_CAT_URL,
+                );
+                if !self.license_msg.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(muted_text(&self.license_msg));
+                }
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    if ui
+                        .add_enabled(valid, egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        do_save = true;
+                    }
+                });
+            });
+
+        // Enter saves (when valid); Escape cancels.
+        let (enter, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if enter
+            && crate::license_mgr::is_valid(&self.license_key_input, &self.license_email_input)
+        {
+            do_save = true;
+        }
+        if escape {
+            do_cancel = true;
+        }
+
+        if do_save {
+            self.settings.license_email = self.license_email_input.trim().to_string();
+            self.settings.license_key =
+                crate::license_mgr::normalize_key(&self.license_key_input);
+            match self.settings.save() {
+                Ok(()) => {
+                    self.status = "License saved. Thank you!".into();
+                    self.license_open = false;
+                    // A valid license suppresses the splash immediately.
+                    self.splash_until = None;
+                }
+                Err(e) => {
+                    self.license_msg = format!("Couldn't save settings: {e}");
+                }
+            }
+        }
+        if do_cancel || !open {
+            self.license_open = false;
+            self.license_msg.clear();
+        }
+    }
+
+    /// Open the License Key dialog, prefilling the currently saved values.
+    fn open_license_dialog(&mut self) {
+        self.license_email_input = self.settings.license_email.clone();
+        self.license_key_input = crate::license_mgr::format_key(&self.settings.license_key);
+        self.license_msg.clear();
+        self.license_open = true;
+    }
+}
+
+/// egui version string, for the About "Built with" line.
+const EGUI_VERSION: &str = "0.36";
+const GLOWING_CAT_URL: &str = "https://glowingcat.com/RenameCheetah.html";
+const ISSUES_URL: &str = "https://github.com/richlesh/TagTiger/issues";
+
+/// A dark dialog background matching RenameCheetah's `#1e1e1e` panels.
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::window(&egui::Style::default())
+        .fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e))
+        .inner_margin(egui::Margin::symmetric(28, 20))
+}
+
+/// Title text (`h1`): 20px, near-white.
+fn title_text(s: &str) -> egui::RichText {
+    egui::RichText::new(s)
+        .size(20.0)
+        .strong()
+        .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0))
+}
+
+/// Body text (`#e0e0e0`), 14px.
+fn body_text(s: &str) -> egui::RichText {
+    egui::RichText::new(s)
+        .size(14.0)
+        .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0))
+}
+
+/// Muted secondary text (`#aaa`), 14px.
+fn muted_text(s: &str) -> egui::RichText {
+    egui::RichText::new(s)
+        .size(14.0)
+        .color(egui::Color32::from_rgb(0xaa, 0xaa, 0xaa))
+}
+
+/// Open a URL in the system browser. Best-effort; ignores failures.
+fn webbrowser_open(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
     }
 }
 

@@ -100,16 +100,62 @@ async fn search(file: PathBuf) -> Result<()> {
 }
 
 fn inspect(file: PathBuf) -> Result<()> {
-    match mp4ameta::Tag::read_from_path(&file) {
-        Ok(t) => {
-            println!("Title:   {:?}", t.title());
-            println!("Year:    {:?}", t.year());
-            println!("Genre:   {:?}", t.genre());
-            println!("Media:   {:?}", t.media_type());
-            println!("Artworks: {}", t.artworks().count());
+    // Read the full metadata via core (parses the iTunMOVI plist, hdvd/derived
+    // definition, iTunEXTC rating, etc.), plus the raw cover bytes.
+    let (meta, cover) = tag::read_from_file(&file)
+        .with_context(|| format!("reading tags from {}", file.display()))?;
+
+    let names = |people: &[tagtiger_core::model::Person]| {
+        if people.is_empty() {
+            "(none)".to_string()
+        } else {
+            people
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
-        Err(e) => println!("No readable tags: {e}"),
-    }
+    };
+    let opt = |o: &Option<String>| o.clone().unwrap_or_else(|| "(none)".into());
+
+    println!("Title:        {}", if meta.title.is_empty() { "(none)".into() } else { meta.title.clone() });
+    println!(
+        "Release date: {}",
+        meta.release_date
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    println!(
+        "Media kind:   {}",
+        meta.video_kind.map(|k| k.label()).unwrap_or("(none)")
+    );
+    println!(
+        "Definition:   {}",
+        meta.definition.map(|d| d.label()).unwrap_or("(none)")
+    );
+    println!("Rating:       {}", opt(&meta.content_rating));
+    println!(
+        "Genres:       {}",
+        if meta.genres.is_empty() {
+            "(none)".to_string()
+        } else {
+            meta.genres.join(", ")
+        }
+    );
+    println!("Studio:       {}", opt(&meta.studio));
+    println!("Directors:    {}", names(&meta.directors));
+    println!("Cast:         {}", names(&meta.cast));
+    println!("Producers:    {}", names(&meta.producers));
+    println!("Screenwriters:{}", names(&meta.writers));
+    println!("Summary:      {}", opt(&meta.summary));
+    println!("Long desc.:   {}", opt(&meta.overview));
+    println!(
+        "Artwork:      {}",
+        match &cover {
+            Some(bytes) => format!("yes ({} bytes)", bytes.len()),
+            None => "(none)".into(),
+        }
+    );
     Ok(())
 }
 
@@ -146,7 +192,19 @@ async fn tag_file(file: PathBuf, id: String, tv: bool, no_artwork: bool) -> Resu
         None
     };
 
-    tag::write_to_file(&file, &meta, encoded.as_ref())?;
+    // Deduce the video Definition (hdvd) from the file's actual track
+    // dimensions when the provider didn't supply one (TMDB never does). This
+    // mirrors what the GUI does when a file is opened.
+    if meta.definition.is_none() {
+        if let Some((w, h)) = tagtiger_core::mp4dim::video_dimensions(&file) {
+            meta.definition = Some(tagtiger_core::model::Definition::from_dimensions(w, h));
+        }
+    }
+
+    // Preserve the file's existing layout: keep a fast-start file fast-start,
+    // and a moov-last file moov-last.
+    let fast_start = tagtiger_core::mp4rewrite::is_fast_start(&file).unwrap_or(false);
+    tag::write_to_file(&file, &meta, encoded.as_ref(), fast_start)?;
     println!("Wrote tags to {}", file.display());
     Ok(())
 }

@@ -24,6 +24,15 @@ rfd = "0.17"
 image.workspace = true
 chrono.workspace = true
 arboard = "3"
+hmac.workspace = true
+sha2.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Windows: embed the .ico into the executable at build time.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 # Package metadata for cargo-deb / cargo-generate-rpm (Linux installers).
 [package.metadata.deb]
@@ -33,12 +42,14 @@ depends = "libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1"
 assets = [
     ["target/release/tagtiger-gui", "usr/bin/", "755"],
     ["../packaging/tagtiger.desktop", "usr/share/applications/", "644"],
+    ["src/resources/app_icon_256.png", "usr/share/icons/hicolor/256x256/apps/tagtiger.png", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/tagtiger-gui", dest = "/usr/bin/tagtiger-gui", mode = "755" },
     { source = "../packaging/tagtiger.desktop", dest = "/usr/share/applications/tagtiger.desktop", mode = "644" },
+    { source = "src/resources/app_icon_256.png", dest = "/usr/share/icons/hicolor/256x256/apps/tagtiger.png", mode = "644" },
 ]
 [package.metadata.generate-rpm.requires]
 libX11 = "*"

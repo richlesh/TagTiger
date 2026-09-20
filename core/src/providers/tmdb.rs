@@ -173,18 +173,8 @@ impl MetadataProvider for TmdbProvider {
                         .filter(|c| c.job.as_deref() == Some("Director"))
                         .map(|c| Person::new(c.name.clone()))
                         .collect(),
-                    producers: credits
-                        .crew
-                        .iter()
-                        .filter(|c| c.job.as_deref() == Some("Producer"))
-                        .map(|c| Person::new(c.name.clone()))
-                        .collect(),
-                    writers: credits
-                        .crew
-                        .iter()
-                        .filter(|c| matches!(c.job.as_deref(), Some("Screenplay") | Some("Writer")))
-                        .map(|c| Person::new(c.name.clone()))
-                        .collect(),
+                    producers: crew_people(&credits.crew, is_producer),
+                    writers: crew_people(&credits.crew, is_writer),
                     content_rating: us_movie_certification(detail.release_dates.as_ref()),
                     video_kind: Some(crate::model::VideoKind::Movie),
                     definition: None,
@@ -249,6 +239,47 @@ fn person_from_cast(c: TmdbCast) -> Person {
         name: c.name,
         role: c.character,
     }
+}
+
+/// Collect distinct crew members (by name, preserving first-seen order) whose
+/// role matches `pred`. TMDB lists the same person once per job, so a producer
+/// credited as both "Producer" and "Executive Producer" would otherwise appear
+/// twice.
+fn crew_people(crew: &[TmdbCrew], pred: fn(&TmdbCrew) -> bool) -> Vec<Person> {
+    let mut out: Vec<Person> = Vec::new();
+    for c in crew.iter().filter(|c| pred(c)) {
+        if !out.iter().any(|p| p.name == c.name) {
+            out.push(Person::new(c.name.clone()));
+        }
+    }
+    out
+}
+
+/// Whether a crew credit is a producer of any kind. Matches the whole
+/// Production department (covers Producer, Executive Producer, Co-Producer,
+/// Associate Producer, Line Producer, …), falling back to job-title matching
+/// when the department is absent.
+fn is_producer(c: &TmdbCrew) -> bool {
+    if c.department.as_deref() == Some("Production") {
+        return true;
+    }
+    c.job
+        .as_deref()
+        .map(|j| j.contains("Producer"))
+        .unwrap_or(false)
+}
+
+/// Whether a crew credit is a writer of any kind. Matches the whole Writing
+/// department (covers Screenplay, Writer, Story, Author, Novel, Characters, …),
+/// falling back to job-title matching when the department is absent.
+fn is_writer(c: &TmdbCrew) -> bool {
+    if c.department.as_deref() == Some("Writing") {
+        return true;
+    }
+    matches!(
+        c.job.as_deref(),
+        Some("Screenplay") | Some("Writer") | Some("Story") | Some("Author") | Some("Novel")
+    )
 }
 
 fn collect_artwork(poster_path: &Option<String>, images: Option<&TmdbImages>) -> Vec<Artwork> {
@@ -397,6 +428,8 @@ struct TmdbCast {
 struct TmdbCrew {
     name: String,
     job: Option<String>,
+    #[serde(default)]
+    department: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -580,5 +613,89 @@ mod tests {
             ],
         };
         assert_eq!(us_tv_rating(Some(&cr)).as_deref(), Some("TV-14"));
+    }
+
+    fn crew(name: &str, job: Option<&str>, dept: Option<&str>) -> TmdbCrew {
+        TmdbCrew {
+            name: name.to_string(),
+            job: job.map(str::to_string),
+            department: dept.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn producers_match_whole_production_department() {
+        let crew_list = vec![
+            crew("Exec Only", Some("Executive Producer"), Some("Production")),
+            crew("Co Prod", Some("Co-Producer"), Some("Production")),
+            crew("A Director", Some("Director"), Some("Directing")),
+            // No department, but a producer job title (fallback path).
+            crew("Bare Producer", Some("Producer"), None),
+        ];
+        let names: Vec<_> = crew_people(&crew_list, is_producer)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["Exec Only", "Co Prod", "Bare Producer"]);
+    }
+
+    #[test]
+    fn writers_match_whole_writing_department() {
+        let crew_list = vec![
+            crew("Screen Writer", Some("Screenplay"), Some("Writing")),
+            crew("Story Person", Some("Story"), Some("Writing")),
+            crew("A Director", Some("Director"), Some("Directing")),
+            // No department, but a writer job title (fallback path).
+            crew("Bare Writer", Some("Writer"), None),
+        ];
+        let names: Vec<_> = crew_people(&crew_list, is_writer)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["Screen Writer", "Story Person", "Bare Writer"]);
+    }
+
+    #[test]
+    fn crew_people_dedupes_by_name() {
+        // Same producer credited under two jobs should appear once.
+        let crew_list = vec![
+            crew("Jane Doe", Some("Producer"), Some("Production")),
+            crew("Jane Doe", Some("Executive Producer"), Some("Production")),
+        ];
+        let names: Vec<_> = crew_people(&crew_list, is_producer)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["Jane Doe"]);
+    }
+
+    #[test]
+    fn parses_producers_writers_from_tmdb_credits_json() {
+        // A realistic (trimmed) TMDB `credits` payload, matching the shape of
+        // the `append_to_response=credits` block on a movie detail response.
+        let json = r#"{
+            "cast": [
+                { "name": "Keanu Reeves", "character": "Neo" }
+            ],
+            "crew": [
+                { "name": "Lana Wachowski", "job": "Director", "department": "Directing" },
+                { "name": "Lilly Wachowski", "job": "Writer", "department": "Writing" },
+                { "name": "Joel Silver", "job": "Producer", "department": "Production" },
+                { "name": "Bruce Berman", "job": "Executive Producer", "department": "Production" }
+            ]
+        }"#;
+        let credits: TmdbCredits = serde_json::from_str(json).unwrap();
+
+        let producers: Vec<_> = crew_people(&credits.crew, is_producer)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let writers: Vec<_> = crew_people(&credits.crew, is_writer)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+
+        assert_eq!(producers, vec!["Joel Silver", "Bruce Berman"]);
+        assert_eq!(writers, vec!["Lilly Wachowski"]);
     }
 }

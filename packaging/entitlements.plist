@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened-runtime entitlements for the TagTiger GUI.
+         TagTiger is a native Rust/egui app that reads/writes user-selected
+         media files and fetches metadata/artwork over HTTPS. It does not use a
+         JIT, load unsigned third-party plugins, or need JVM-style relaxations,
+         so the runtime stays locked down. -->
+
+    <!-- Allow outbound network connections (TMDB API + artwork downloads). -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Allow reading/writing files the user selects (open/save dialogs). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>

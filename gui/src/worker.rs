@@ -48,6 +48,9 @@ pub enum Request {
         /// Raw image bytes (PNG/JPEG) to use as the cover, overriding
         /// `artwork_url`. Set when the user pasted/dropped a poster.
         cover_override: Option<Vec<u8>>,
+        /// Whether to write a fast-start (moov-first) layout. When false, moov
+        /// is placed after mdat.
+        fast_start: bool,
     },
 }
 
@@ -67,6 +70,8 @@ pub enum Event {
         cover_bytes: Option<Vec<u8>>,
         /// Video track pixel dimensions (width, height), if detectable.
         video_dimensions: Option<(u32, u32)>,
+        /// Whether the file is currently a fast-start (moov-first) file.
+        fast_start: bool,
     },
     SearchDone {
         results: Vec<SearchResult>,
@@ -243,6 +248,7 @@ async fn handle(
             meta,
             artwork_url,
             cover_override,
+            fast_start,
         } => {
             let encoded: Option<EncodedArtwork> = if let Some(bytes) = cover_override {
                 // Pasted/dropped image takes priority.
@@ -265,7 +271,13 @@ async fn handle(
                 let _ = evt_tx.send(Event::WriteProgress(done, total));
                 repaint();
             };
-            tag::write_to_file_with_progress(&file, &meta, encoded.as_ref(), &mut on_progress)?;
+            tag::write_to_file_with_progress(
+                &file,
+                &meta,
+                encoded.as_ref(),
+                fast_start,
+                &mut on_progress,
+            )?;
             Ok(Some(Event::WriteDone { file }))
         }
     }
@@ -277,6 +289,8 @@ fn load_file(file: PathBuf) -> Event {
     let (meta, cover_bytes) = tag::read_from_file(&file).unwrap_or_default();
     // Video track dimensions (best effort).
     let video_dimensions = tagtiger_core::mp4dim::video_dimensions(&file);
+    // Whether the file is currently fast-start (moov before mdat).
+    let fast_start = tagtiger_core::mp4rewrite::is_fast_start(&file).unwrap_or(false);
 
     // Suggested search: existing title, else the filename stem.
     let suggested_query = if !meta.title.trim().is_empty() {
@@ -305,5 +319,6 @@ fn load_file(file: PathBuf) -> Event {
         cover_size,
         cover_bytes,
         video_dimensions,
+        fast_start,
     }
 }

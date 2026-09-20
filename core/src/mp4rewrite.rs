@@ -201,6 +201,146 @@ pub fn normalize_moov_last(
     Ok(true)
 }
 
+/// Returns true if the file is "fast start" (web-optimized): its `moov` box
+/// precedes its `mdat`, so a streaming client can read the sample tables before
+/// the media. Equivalent to [`moov_precedes_mdat`] but named for the concept.
+pub fn is_fast_start(path: impl AsRef<Path>) -> Result<bool> {
+    moov_precedes_mdat(path)
+}
+
+/// Rewrite `src_path` into `dst_path` with `moov` moved to the **front**
+/// (before `mdat`), producing a "fast start" / web-optimized layout:
+///
+///   [ftyp] [moov] [free padding] [mdat] [any trailing boxes]
+///
+/// The `stco`/`co64` chunk-offset tables inside `moov` are patched by the exact
+/// byte delta that `mdat` moved. A small `free` box is written after `moov`;
+/// this is conventional padding in fast-start files. Note that `mp4ameta` does
+/// not reclaim adjacent `free` space when it grows `moov` (it shifts `mdat`
+/// instead), so this padding does not, by itself, make later edits cheaper —
+/// it is kept only for layout conventionality.
+///
+/// Streams large boxes (notably `mdat`) so memory stays bounded. Reports
+/// progress via the callback as `(bytes_done, bytes_total)`.
+///
+/// Returns `Ok(false)` if no reordering is applicable (missing moov/mdat).
+pub fn normalize_moov_first(
+    src_path: &Path,
+    dst_path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<bool> {
+    /// Small conventional `free` box written after `moov`. Must be >= 8 (a
+    /// `free` box header). Kept minimal since mp4ameta does not reclaim it.
+    const FREE_PAD: u64 = 8;
+
+    let mut src = File::open(src_path)?;
+    let layout = scan_layout(&mut src)?;
+
+    let Some(moov_idx) = layout.index_of(b"moov") else {
+        return Ok(false);
+    };
+    let Some(mdat_idx) = layout.index_of(b"mdat") else {
+        return Ok(false);
+    };
+
+    let moov = layout.boxes[moov_idx];
+    let mdat = layout.boxes[mdat_idx];
+    let old_mdat_start = mdat.start;
+
+    // Read the entire moov into memory (metadata is small relative to mdat).
+    let mut moov_bytes = vec![0u8; moov.len as usize];
+    src.seek(SeekFrom::Start(moov.start))?;
+    src.read_exact(&mut moov_bytes)?;
+
+    // Determine the output box order: [ftyp?] [moov] [free FREE_PAD] then every
+    // remaining box (mdat and any others such as pre-existing `free` boxes) in
+    // their original relative order. We must compute where `mdat` actually
+    // lands in this output — accounting for *every* box written before it, not
+    // just ftyp+moov — so the chunk-offset delta is exact. Getting this wrong
+    // (e.g. ignoring a pre-existing `free` box between ftyp and mdat) shifts
+    // the offsets and produces a file that decodes to nothing.
+    let ftyp_idx = layout.index_of(b"ftyp");
+
+    // Walk the planned output, summing box lengths until we reach mdat, to get
+    // its true new absolute start.
+    let mut new_mdat_start = 0u64;
+    if let Some(i) = ftyp_idx {
+        new_mdat_start += layout.boxes[i].len;
+    }
+    new_mdat_start += moov.len; // moov (unchanged length; we only patch offsets)
+    new_mdat_start += FREE_PAD; // our inserted free box
+    for (i, b) in layout.boxes.iter().enumerate() {
+        if i == moov_idx || Some(i) == ftyp_idx {
+            continue;
+        }
+        if i == mdat_idx {
+            break; // reached mdat in output order
+        }
+        new_mdat_start += b.len; // e.g. a pre-existing free box before mdat
+    }
+
+    let delta: i64 = new_mdat_start as i64 - old_mdat_start as i64;
+    patch_chunk_offsets(&mut moov_bytes, delta)?;
+
+    // Progress accounting: total bytes streamed = everything except moov (moov
+    // is written from memory).
+    let grand_total: u64 = layout
+        .boxes
+        .iter()
+        .filter(|b| b.start != moov.start)
+        .map(|b| b.len)
+        .sum();
+    let mut written = 0u64;
+
+    let mut dst = File::create(dst_path)?;
+
+    // 1) ftyp first, if present.
+    if let Some(i) = ftyp_idx {
+        let b = layout.boxes[i];
+        src.seek(SeekFrom::Start(b.start))?;
+        stream_copy(&mut src, &mut dst, b.len, written, grand_total, progress)?;
+        written += b.len;
+    }
+
+    // 2) moov (from the patched in-memory copy).
+    dst.write_all(&moov_bytes)?;
+
+    // 3) free padding box: header (size + 'free') then zeroed body.
+    write_free_box(&mut dst, FREE_PAD)?;
+
+    // 4) every remaining box (mdat and any others) in original order.
+    for (i, b) in layout.boxes.iter().enumerate() {
+        if i == moov_idx || Some(i) == ftyp_idx {
+            continue;
+        }
+        src.seek(SeekFrom::Start(b.start))?;
+        stream_copy(&mut src, &mut dst, b.len, written, grand_total, progress)?;
+        written += b.len;
+    }
+
+    dst.flush()?;
+    Ok(true)
+}
+
+/// Write a `free` box of exactly `total_len` bytes (including its 8-byte
+/// header). `total_len` must be >= 8.
+fn write_free_box(dst: &mut File, total_len: u64) -> Result<()> {
+    debug_assert!(total_len >= 8);
+    let mut hdr = [0u8; 8];
+    hdr[..4].copy_from_slice(&(total_len as u32).to_be_bytes());
+    hdr[4..].copy_from_slice(b"free");
+    dst.write_all(&hdr)?;
+    // Body: total_len - 8 zero bytes, written in bounded chunks.
+    let mut remaining = total_len - 8;
+    let zeros = [0u8; 4096];
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        dst.write_all(&zeros[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
 /// Walk the moov box bytes and add `delta` to every entry of every `stco`
 /// (32-bit) and `co64` (64-bit) chunk-offset table found within.
 ///
@@ -358,5 +498,176 @@ mod tests {
             moov[last4 + 3],
         ]);
         assert_eq!(v, 3500);
+    }
+
+    fn box_wrap(fourcc: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (8 + content.len()) as u32;
+        let mut v = Vec::new();
+        v.extend_from_slice(&size.to_be_bytes());
+        v.extend_from_slice(fourcc);
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// Building a moov-before-mdat file, normalizing it, and confirming the
+    /// result is moov-after-mdat is the guarantee that makes a *second* save
+    /// take the cheap in-place path instead of rewriting again.
+    #[test]
+    fn normalize_moves_moov_after_mdat_and_patches_offsets() {
+        use std::io::Write;
+
+        // Synthetic layout: ftyp | moov{trak/mdia/minf/stbl/stco} | mdat.
+        // The single stco entry points at the mdat *content* absolute offset.
+        let ftyp = box_wrap(b"ftyp", &[b'i', b's', b'o', b'm', 0, 0, 0, 0]);
+
+        // Placeholder stco (offset patched below once we know mdat's position).
+        let mut stco_content = vec![0u8, 0, 0, 0]; // version/flags
+        stco_content.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        stco_content.extend_from_slice(&0u32.to_be_bytes()); // placeholder offset
+        let stco = box_wrap(b"stco", &stco_content);
+        let stbl = box_wrap(b"stbl", &stco);
+        let minf = box_wrap(b"minf", &stbl);
+        let mdia = box_wrap(b"mdia", &minf);
+        let trak = box_wrap(b"trak", &mdia);
+        let mut moov = box_wrap(b"moov", &trak);
+
+        let mdat_payload = b"MEDIA-SAMPLE-BYTES";
+        let mdat = box_wrap(b"mdat", mdat_payload);
+
+        // Original absolute offset of the mdat *content* (payload starts after
+        // ftyp + moov + the 8-byte mdat header).
+        let mdat_content_off = (ftyp.len() + moov.len() + 8) as u32;
+        // Patch the stco entry (last 4 bytes of moov) to that offset.
+        let n = moov.len();
+        moov[n - 4..].copy_from_slice(&mdat_content_off.to_be_bytes());
+
+        let dir = std::env::temp_dir();
+        let src = dir.join(format!("tagtiger_norm_src_{}.mp4", std::process::id()));
+        let dst = dir.join(format!("tagtiger_norm_dst_{}.mp4", std::process::id()));
+        {
+            let mut f = File::create(&src).unwrap();
+            f.write_all(&ftyp).unwrap();
+            f.write_all(&moov).unwrap();
+            f.write_all(&mdat).unwrap();
+        }
+
+        // Precondition: moov precedes mdat (the shift path would trigger).
+        assert!(moov_precedes_mdat(&src).unwrap());
+
+        let mut prog = |_: u64, _: u64| {};
+        let normalized = normalize_moov_last(&src, &dst, &mut prog).unwrap();
+        assert!(normalized, "normalization should apply to a moov-first file");
+
+        // Postcondition: moov now comes after mdat, so a subsequent write takes
+        // the in-place path.
+        assert!(
+            !moov_precedes_mdat(&dst).unwrap(),
+            "after normalization, moov must follow mdat"
+        );
+
+        // The stco offset must have been patched so it still points at the same
+        // mdat content. In the output, mdat sits right after ftyp, so its
+        // content begins at ftyp.len() + 8.
+        let out = std::fs::read(&dst).unwrap();
+        let mut layout_file = File::open(&dst).unwrap();
+        let layout = scan_layout(&mut layout_file).unwrap();
+        let moov_box = layout.boxes[layout.index_of(b"moov").unwrap()];
+        // stco offset is the last 4 bytes of the relocated moov box.
+        let patched_off = {
+            let end = (moov_box.start + moov_box.len) as usize;
+            u32::from_be_bytes([out[end - 4], out[end - 3], out[end - 2], out[end - 1]])
+        };
+        let expected_off = (ftyp.len() + 8) as u32;
+        assert_eq!(
+            patched_off, expected_off,
+            "stco offset should track mdat's new absolute position"
+        );
+        // And it should indeed point at the preserved payload.
+        assert_eq!(
+            &out[patched_off as usize..patched_off as usize + mdat_payload.len()],
+            mdat_payload
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// Building a moov-last file, normalizing it to fast-start, and confirming
+    /// the result is moov-first with a `free` pad and correctly patched chunk
+    /// offsets is the guarantee behind the "Fast-start" checkbox.
+    #[test]
+    fn normalize_moves_moov_before_mdat_and_patches_offsets() {
+        use std::io::Write;
+
+        // Synthetic moov-last layout with a pre-existing `free` box between
+        // ftyp and mdat — exactly what ffmpeg emits. This box must be counted
+        // when computing mdat's new position, or the chunk offsets end up off
+        // by its size and the file decodes to nothing.
+        let ftyp = box_wrap(b"ftyp", &[b'i', b's', b'o', b'm', 0, 0, 0, 0]);
+        let pre_free = box_wrap(b"free", &[0u8; 4]); // 12-byte free box
+        let mdat_payload = b"MEDIA-SAMPLE-BYTES-XYZ";
+        let mdat = box_wrap(b"mdat", mdat_payload);
+
+        // Original mdat content offset = ftyp + pre_free + mdat header (8).
+        let old_mdat_content_off = (ftyp.len() + pre_free.len() + 8) as u32;
+
+        let mut stco_content = vec![0u8, 0, 0, 0];
+        stco_content.extend_from_slice(&1u32.to_be_bytes()); // one entry
+        stco_content.extend_from_slice(&old_mdat_content_off.to_be_bytes());
+        let stco = box_wrap(b"stco", &stco_content);
+        let stbl = box_wrap(b"stbl", &stco);
+        let minf = box_wrap(b"minf", &stbl);
+        let mdia = box_wrap(b"mdia", &minf);
+        let trak = box_wrap(b"trak", &mdia);
+        let moov = box_wrap(b"moov", &trak);
+
+        let dir = std::env::temp_dir();
+        let src = dir.join(format!("tagtiger_ff_src_{}.mp4", std::process::id()));
+        let dst = dir.join(format!("tagtiger_ff_dst_{}.mp4", std::process::id()));
+        {
+            let mut f = File::create(&src).unwrap();
+            f.write_all(&ftyp).unwrap();
+            f.write_all(&pre_free).unwrap();
+            f.write_all(&mdat).unwrap();
+            f.write_all(&moov).unwrap();
+        }
+
+        // Precondition: not fast-start (moov after mdat).
+        assert!(!is_fast_start(&src).unwrap());
+
+        let mut prog = |_: u64, _: u64| {};
+        let normalized = normalize_moov_first(&src, &dst, &mut prog).unwrap();
+        assert!(normalized);
+
+        // Postcondition: now fast-start (moov before mdat).
+        assert!(
+            is_fast_start(&dst).unwrap(),
+            "after normalization, moov must precede mdat"
+        );
+
+        // The stco offset must now point at mdat's new content position, and
+        // that position must still contain the original payload — this is the
+        // key regression check: it fails if a box before mdat (the pre-existing
+        // free) isn't accounted for in the delta.
+        let mut df = File::open(&dst).unwrap();
+        let layout = scan_layout(&mut df).unwrap();
+        let out = std::fs::read(&dst).unwrap();
+        let mdat_box = layout.boxes[layout.index_of(b"mdat").unwrap()];
+        let new_content_off = (mdat_box.start + 8) as u32;
+        let moov_box = layout.boxes[layout.index_of(b"moov").unwrap()];
+        let end = (moov_box.start + moov_box.len) as usize;
+        let patched_off =
+            u32::from_be_bytes([out[end - 4], out[end - 3], out[end - 2], out[end - 1]]);
+        assert_eq!(
+            patched_off, new_content_off,
+            "stco offset should track mdat's new absolute position"
+        );
+        assert_eq!(
+            &out[patched_off as usize..patched_off as usize + mdat_payload.len()],
+            mdat_payload
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
     }
 }
