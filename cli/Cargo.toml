@@ -1,0 +1,23 @@
+[package]
+name = "tagtiger-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command-line frontend for TagTiger"
+
+[[bin]]
+name = "tagtiger"
+path = "src/main.rs"
+
+[dependencies]
+tagtiger-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+mp4ameta.workspace = true

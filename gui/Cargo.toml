@@ -1,0 +1,45 @@
+[package]
+name = "tagtiger-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "egui desktop frontend for TagTiger"
+
+[[bin]]
+name = "tagtiger-gui"
+path = "src/main.rs"
+
+[dependencies]
+tagtiger-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe = "0.36"
+rfd = "0.17"
+image.workspace = true
+chrono.workspace = true
+arboard = "3"
+
+# Package metadata for cargo-deb / cargo-generate-rpm (Linux installers).
+[package.metadata.deb]
+section = "video"
+priority = "optional"
+depends = "libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1"
+assets = [
+    ["target/release/tagtiger-gui", "usr/bin/", "755"],
+    ["../packaging/tagtiger.desktop", "usr/share/applications/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/tagtiger-gui", dest = "/usr/bin/tagtiger-gui", mode = "755" },
+    { source = "../packaging/tagtiger.desktop", dest = "/usr/share/applications/tagtiger.desktop", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+libX11 = "*"
+mesa-libGL = "*"

@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+
+# Local secrets / config
+.env
+*.local
+
+# Editor
+.idea/
+.vscode/
+*.swp

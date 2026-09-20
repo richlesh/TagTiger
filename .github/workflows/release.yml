@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux x86-64 (built on 22.04 for a low glibc floor) ----
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            linux_pkg: true
+            cross: false
+          # ---- Linux ARM64 (cross-compiled) ----
+          - name: linux-aarch64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            linux_pkg: true
+            cross: true
+          # ---- macOS x86-64 ----
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            linux_pkg: false
+            cross: false
+          # ---- macOS ARM64 ----
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            linux_pkg: false
+            cross: false
+          # ---- Windows x86-64 ----
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            linux_pkg: false
+            cross: false
+          # ---- Windows ARM64 ----
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            linux_pkg: false
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Native Linux GUI build deps (x86_64 host build).
+      - name: Install Linux build deps (native)
+        if: matrix.os == 'ubuntu-22.04' && matrix.cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
+            libxi-dev libgl1-mesa-dev libxkbcommon-dev
+
+      # For aarch64 Linux we use `cross`, which builds inside a container that
+      # carries the correct cross sysroot and GUI libs.
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }} --workspace
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }} --workspace
+
+      # ---- Package: Linux .deb + .rpm ----
+      - name: Install packaging tools
+        if: matrix.linux_pkg == true
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: Build .deb
+        if: matrix.linux_pkg == true
+        run: |
+          cargo deb -p tagtiger-gui --no-build --target ${{ matrix.target }} --output dist/
+        # --no-build: reuse the release artifacts we already built above.
+
+      - name: Build .rpm
+        if: matrix.linux_pkg == true
+        run: |
+          mkdir -p dist
+          cargo generate-rpm -p gui --target ${{ matrix.target }} \
+            --output dist/tagtiger-${{ matrix.target }}.rpm
+
+      # ---- Package: macOS / Windows archives ----
+      - name: Archive (unix)
+        if: runner.os != 'Windows' && matrix.linux_pkg == false
+        run: |
+          mkdir -p dist
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/dist/tagtiger-${{ matrix.target }}.tar.gz" \
+            tagtiger tagtiger-gui
+
+      - name: Archive (linux binaries too)
+        if: matrix.linux_pkg == true
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/dist/tagtiger-${{ matrix.target }}.tar.gz" \
+            tagtiger tagtiger-gui
+
+      - name: Archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path `
+            "target/${{ matrix.target }}/release/tagtiger.exe", `
+            "target/${{ matrix.target }}/release/tagtiger-gui.exe" `
+            -DestinationPath "dist/tagtiger-${{ matrix.target }}.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tagtiger-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
