@@ -66,46 +66,49 @@ PLIST
 
 echo "==> Bundle assembled at $BUNDLE"
 
-# ---- Optionally codesign the bundle -----------------------------------------
-# When TAGTIGER_SIGN_IDENTITY is set (CI with a Developer ID cert imported into
-# the keychain), sign the nested executables and the .app with the hardened
-# runtime and our entitlements. Signing the DMG and notarizing happen in the
-# workflow after this script returns. When the var is unset (local builds), the
-# bundle is left unsigned.
-ENTITLEMENTS="$REPO_ROOT/packaging/entitlements.plist"
 # Resolve the signing identity. Prefer a full identity in TAGTIGER_SIGN_IDENTITY;
 # otherwise build one from TAGTIGER_SIGN_IDENTITY_NAME (the bare team/name), to
 # keep the CI YAML free of the colon in "Developer ID Application:".
+ENTITLEMENTS="$REPO_ROOT/packaging/entitlements.plist"
 SIGN_IDENTITY="${TAGTIGER_SIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" && -n "${TAGTIGER_SIGN_IDENTITY_NAME:-}" ]]; then
   SIGN_IDENTITY="Developer ID Application: ${TAGTIGER_SIGN_IDENTITY_NAME}"
 fi
-if [[ -n "$SIGN_IDENTITY" ]]; then
-  echo "==> Codesigning bundle as: $SIGN_IDENTITY"
-  KEYCHAIN_ARGS=()
-  if [[ -n "${TAGTIGER_KEYCHAIN:-}" ]]; then
-    KEYCHAIN_ARGS=(--keychain "$TAGTIGER_KEYCHAIN")
-  fi
-  # Sign the nested CLI binary first (inner-to-outer signing order).
-  if [[ -f "$BUNDLE/Contents/MacOS/tagtiger" ]]; then
+KEYCHAIN_ARGS=()
+if [[ -n "${TAGTIGER_KEYCHAIN:-}" ]]; then
+  KEYCHAIN_ARGS=(--keychain "$TAGTIGER_KEYCHAIN")
+fi
+
+# Sign the .app in place. Inner code (the nested CLI) is signed first, then the
+# main executable, then the bundle itself — hardened runtime + secure timestamp
+# + entitlements throughout. Verified before use. When no identity is set (local
+# builds) the bundle is left unsigned.
+sign_app() {
+  local app="$1"
+  [[ -n "$SIGN_IDENTITY" ]] || return 0
+  echo "==> Codesigning $app as: $SIGN_IDENTITY"
+  # Expand KEYCHAIN_ARGS safely even when empty (bash 3.2 + set -u).
+  local kc=(${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
+  if [[ -f "$app/Contents/MacOS/tagtiger" ]]; then
     codesign --force --options runtime --timestamp \
       --entitlements "$ENTITLEMENTS" \
-      --sign "$SIGN_IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-      "$BUNDLE/Contents/MacOS/tagtiger"
+      --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
+      "$app/Contents/MacOS/tagtiger"
   fi
-  # Sign the main executable, then the bundle as a whole.
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
-    --sign "$SIGN_IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-    "$BUNDLE/Contents/MacOS/$APP_NAME"
+    --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
+    "$app/Contents/MacOS/$APP_NAME"
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
-    --sign "$SIGN_IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-    "$BUNDLE"
-  # Verify before we wrap it in a DMG.
-  codesign --verify --deep --strict --verbose=2 "$BUNDLE"
-  echo "==> Bundle signed and verified"
-fi
+    --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
+    "$app"
+  codesign --verify --deep --strict --verbose=2 "$app"
+  echo "==> $app signed and verified"
+}
+
+# Sign the bundle that ships in the .tar.gz.
+sign_app "$BUNDLE"
 
 # ---- Build a .dmg with a volume icon ----------------------------------------
 # Approach: create a writable DMG from the staged contents, mount it, drop the
@@ -122,7 +125,12 @@ cleanup() {
 trap cleanup EXIT
 
 # Lay out what the mounted volume will contain: the app + an Applications link.
-cp -R "$BUNDLE" "$STAGING/$APP_NAME.app"
+# Use `ditto` (not `cp -R`), which preserves code-signature metadata and
+# extended attributes — a plain copy corrupts the signature and fails
+# notarization. Re-sign the staged copy afterwards to guarantee the sealed
+# signature matches the exact bytes placed in the image.
+ditto "$BUNDLE" "$STAGING/$APP_NAME.app"
+sign_app "$STAGING/$APP_NAME.app"
 ln -s /Applications "$STAGING/Applications"
 cp "$ICNS" "$STAGING/.VolumeIcon.icns"
 
