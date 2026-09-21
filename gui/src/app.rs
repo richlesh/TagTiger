@@ -1780,7 +1780,7 @@ impl App {
         self.icon_tex.clone()
     }
 
-    /// The About dialog — a native rendering of RenameCheetah's `about.html`:
+    /// The About dialog — a native rendering of TagTiger's `about.html`:
     /// dark panel, rounded 96px icon, title, version/copyright/build lines,
     /// links, and an OK button.
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -1844,7 +1844,7 @@ impl App {
         }
     }
 
-    /// The startup splash — a native rendering of RenameCheetah's `splash.html`:
+    /// The startup splash — a native rendering of TagTiger's `splash.html`:
     /// dark panel, icon, title, version, and a donate message with a link.
     /// Auto-closes after 20 seconds; also closes on a click anywhere except the
     /// donate link.
@@ -1908,7 +1908,7 @@ impl App {
         }
     }
 
-    /// The License Key dialog — a native rendering of RenameCheetah's
+    /// The License Key dialog — a native rendering of TagTiger's
     /// `license_dialog.html`: email + key inputs with live validation, a donate
     /// link, and Cancel/Save. Save is enabled only when the key is valid for
     /// the entered email; saving persists the license to settings.
@@ -2035,10 +2035,10 @@ impl App {
 
 /// egui version string, for the About "Built with" line.
 const EGUI_VERSION: &str = "0.36";
-const GLOWING_CAT_URL: &str = "https://glowingcat.com/RenameCheetah.html";
+const GLOWING_CAT_URL: &str = "https://glowingcat.com/TagTiger.html";
 const ISSUES_URL: &str = "https://github.com/richlesh/TagTiger/issues";
 
-/// A dark dialog background matching RenameCheetah's `#1e1e1e` panels.
+/// A dark dialog background matching TagTiger's `#1e1e1e` panels.
 fn dialog_frame() -> egui::Frame {
     egui::Frame::window(&egui::Style::default())
         .fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e))
