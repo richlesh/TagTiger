@@ -1532,8 +1532,7 @@ impl eframe::App for App {
                                 self.splash_pending = false;
                                 self.splash_shown_at = std::time::Instant::now();
                                 self.splash_until = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_secs(20),
+                                    std::time::Instant::now() + std::time::Duration::from_secs(20),
                                 );
                             }
                         }
@@ -2299,8 +2298,7 @@ impl App {
             }
         };
         if !cli.exists() {
-            self.status =
-                "Couldn't find the bundled CLI (tagtiger-cli) next to the app.".into();
+            self.status = "Couldn't find the bundled CLI (tagtiger-cli) next to the app.".into();
             return;
         }
 
@@ -2355,9 +2353,7 @@ impl App {
         // osascript "do shell script ... with administrator privileges" wants a
         // string literal; escape backslashes and double quotes for AppleScript.
         let as_literal = shell_cmd.replace('\\', r"\\").replace('"', r#"\""#);
-        let script = format!(
-            "do shell script \"{as_literal}\" with administrator privileges"
-        );
+        let script = format!("do shell script \"{as_literal}\" with administrator privileges");
 
         match std::process::Command::new("osascript")
             .arg("-e")

@@ -123,10 +123,7 @@ impl Worker {
     /// Spawn the worker thread. `repaint` is called after each event so egui
     /// wakes up to process it. `initial_token` is the saved TMDB Bearer token
     /// from settings (empty to fall back to the environment).
-    pub fn spawn(
-        initial_token: String,
-        repaint: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
+    pub fn spawn(initial_token: String, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Event>();
         let repaint = Arc::new(repaint);
