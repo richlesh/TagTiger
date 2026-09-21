@@ -166,6 +166,8 @@ jobs:
       - name: Package macOS .app + .dmg
         if: runner.os == 'macOS'
         env:
+          # The bare identity name (after "Developer ID Application: "). If unset
+          # or mismatched, the script auto-detects the identity from the keychain.
           TAGTIGER_SIGN_IDENTITY_NAME: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           TAGTIGER_KEYCHAIN: ${{ runner.temp }}/build.keychain
         run: |
@@ -185,7 +187,10 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
-          IDENTITY="Developer ID Application: ${APPLE_SIGNING_IDENTITY}"
+          # Accept either a bare name or a full "Developer ID Application: ..."
+          # value in the secret; normalize to the full identity string.
+          NAME="${APPLE_SIGNING_IDENTITY#Developer ID Application: }"
+          IDENTITY="Developer ID Application: ${NAME}"
           DMG="dist/TagTiger-${{ matrix.target }}.dmg"
 
           # Sign the disk image itself.

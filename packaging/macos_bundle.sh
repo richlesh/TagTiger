@@ -66,26 +66,45 @@ PLIST
 
 echo "==> Bundle assembled at $BUNDLE"
 
-# Resolve the signing identity. Prefer a full identity in TAGTIGER_SIGN_IDENTITY;
-# otherwise build one from TAGTIGER_SIGN_IDENTITY_NAME (the bare team/name), to
-# keep the CI YAML free of the colon in "Developer ID Application:".
+# Resolve the signing identity:
+#   1. TAGTIGER_SIGN_IDENTITY  — a full identity string, used as-is.
+#   2. TAGTIGER_SIGN_IDENTITY_NAME — the name after "Developer ID Application: ".
+#   3. Auto-detect the first "Developer ID Application" identity in the keychain.
+# Auto-detection avoids depending on an exactly-matching secret string.
 ENTITLEMENTS="$REPO_ROOT/packaging/entitlements.plist"
 SIGN_IDENTITY="${TAGTIGER_SIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" && -n "${TAGTIGER_SIGN_IDENTITY_NAME:-}" ]]; then
-  SIGN_IDENTITY="Developer ID Application: ${TAGTIGER_SIGN_IDENTITY_NAME}"
+  # Accept either a bare name or a full "Developer ID Application: ..." value.
+  _name="${TAGTIGER_SIGN_IDENTITY_NAME#Developer ID Application: }"
+  SIGN_IDENTITY="Developer ID Application: ${_name}"
 fi
 KEYCHAIN_ARGS=()
 if [[ -n "${TAGTIGER_KEYCHAIN:-}" ]]; then
   KEYCHAIN_ARGS=(--keychain "$TAGTIGER_KEYCHAIN")
 fi
+if [[ -z "$SIGN_IDENTITY" && -n "${TAGTIGER_KEYCHAIN:-}" ]]; then
+  # Pull the exact identity name from the keychain (robust to typos in secrets).
+  AUTO_ID="$(security find-identity -v -p codesigning "$TAGTIGER_KEYCHAIN" 2>/dev/null \
+    | grep -o '"Developer ID Application:[^"]*"' | head -1 | tr -d '"' || true)"
+  if [[ -n "$AUTO_ID" ]]; then
+    SIGN_IDENTITY="$AUTO_ID"
+  fi
+fi
+
+# Diagnostics: show what codesigning identities are visible.
+if [[ -n "${TAGTIGER_KEYCHAIN:-}" ]]; then
+  echo "==> Available codesigning identities in $TAGTIGER_KEYCHAIN:"
+  security find-identity -v -p codesigning "$TAGTIGER_KEYCHAIN" || true
+fi
+echo "==> Resolved signing identity: '${SIGN_IDENTITY:-<none>}'"
 
 # Sign the .app in place. Inner code (the nested CLI) is signed first, then the
 # main executable, then the bundle itself — hardened runtime + secure timestamp
-# + entitlements throughout. Verified before use. When no identity is set (local
-# builds) the bundle is left unsigned.
+# + entitlements throughout. Verified before use. When no identity is resolved
+# (local builds) the bundle is left unsigned.
 sign_app() {
   local app="$1"
-  [[ -n "$SIGN_IDENTITY" ]] || return 0
+  [[ -n "$SIGN_IDENTITY" ]] || { echo "==> No identity; leaving $app unsigned"; return 0; }
   echo "==> Codesigning $app as: $SIGN_IDENTITY"
   # Expand KEYCHAIN_ARGS safely even when empty (bash 3.2 + set -u).
   local kc=(${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
@@ -103,7 +122,12 @@ sign_app() {
     --entitlements "$ENTITLEMENTS" \
     --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
     "$app"
+  # Strict verification, and confirm the main executable carries the hardened
+  # runtime + a secure timestamp (the exact things notarization checks).
   codesign --verify --deep --strict --verbose=2 "$app"
+  echo "==> Signature details for the main executable:"
+  codesign --display --verbose=4 "$app/Contents/MacOS/$APP_NAME" 2>&1 \
+    | grep -Ei 'flags|Timestamp|Authority' || true
   echo "==> $app signed and verified"
 }
 
@@ -157,5 +181,25 @@ MOUNT_DIR=""
 echo "==> Converting to compressed image: $DMG"
 rm -f "$DMG"
 hdiutil convert "$DMG_RW" -format UDZO -o "$DMG" >/dev/null
+
+# Safety net: verify the app signature inside the *finished* compressed image.
+# Fail the build here (with diagnostics) rather than at notarization if the
+# signature didn't survive being placed into the DMG.
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  echo "==> Verifying signature inside the finished DMG"
+  VERIFY_MNT="$(mktemp -d)"
+  hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$VERIFY_MNT" >/dev/null
+  if codesign --verify --deep --strict --verbose=2 "$VERIFY_MNT/$APP_NAME.app"; then
+    echo "==> DMG app signature verified"
+  else
+    echo "ERROR: app signature invalid inside the finished DMG" >&2
+    codesign --display --verbose=4 "$VERIFY_MNT/$APP_NAME.app/Contents/MacOS/$APP_NAME" 2>&1 || true
+    hdiutil detach "$VERIFY_MNT" >/dev/null 2>&1 || true
+    rmdir "$VERIFY_MNT" 2>/dev/null || true
+    exit 1
+  fi
+  hdiutil detach "$VERIFY_MNT" >/dev/null
+  rmdir "$VERIFY_MNT" 2>/dev/null || true
+fi
 
 echo "==> Done: $DMG"
