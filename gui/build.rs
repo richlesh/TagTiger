@@ -29,9 +29,59 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
-        // `app_icon.rc` references the .ico via a relative path. The resource
-        // is cosmetic (icon only), so a missing manifest toolchain is not fatal.
-        embed_resource::compile("app_icon.rc", embed_resource::NONE)
+        // Generate a version-info resource so Explorer's "Open with" and file
+        // properties show a friendly "TagTiger" (via FileDescription) instead
+        // of the raw "tagtiger-gui.exe" filename. Combined with the icon.
+        let ver = env!("CARGO_PKG_VERSION"); // e.g. "1.0.0"
+        let mut parts = ver.split('.').map(|s| s.parse::<u16>().unwrap_or(0));
+        let (maj, min, pat) = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let rc_path = std::path::Path::new(&out_dir).join("tagtiger_version.rc");
+        // The .ico path must be absolute here since the generated .rc lives in
+        // OUT_DIR, not the crate root.
+        let ico =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/resources/app_icon.ico");
+        let ico_str = ico.to_string_lossy().replace('\\', "\\\\");
+        let rc = format!(
+            "IDI_ICON1 ICON \"{ico}\"\n\
+             1 VERSIONINFO\n\
+             FILEVERSION {maj},{min},{pat},0\n\
+             PRODUCTVERSION {maj},{min},{pat},0\n\
+             FILEOS 0x40004L\n\
+             FILETYPE 0x1L\n\
+             BEGIN\n\
+             \x20 BLOCK \"StringFileInfo\"\n\
+             \x20 BEGIN\n\
+             \x20   BLOCK \"040904b0\"\n\
+             \x20   BEGIN\n\
+             \x20     VALUE \"CompanyName\", \"Glowing Cat Software\"\n\
+             \x20     VALUE \"FileDescription\", \"TagTiger\"\n\
+             \x20     VALUE \"FileVersion\", \"{ver}\"\n\
+             \x20     VALUE \"InternalName\", \"TagTiger\"\n\
+             \x20     VALUE \"OriginalFilename\", \"tagtiger-gui.exe\"\n\
+             \x20     VALUE \"ProductName\", \"TagTiger\"\n\
+             \x20     VALUE \"ProductVersion\", \"{ver}\"\n\
+             \x20   END\n\
+             \x20 END\n\
+             \x20 BLOCK \"VarFileInfo\"\n\
+             \x20 BEGIN\n\
+             \x20   VALUE \"Translation\", 0x409, 1200\n\
+             \x20 END\n\
+             END\n",
+            ico = ico_str,
+            maj = maj,
+            min = min,
+            pat = pat,
+            ver = ver,
+        );
+        std::fs::write(&rc_path, rc).expect("write version .rc");
+        // The resource is cosmetic (icon + version strings), so a missing
+        // manifest toolchain is not fatal.
+        embed_resource::compile(&rc_path, embed_resource::NONE)
             .manifest_optional()
             .unwrap();
     }
