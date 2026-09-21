@@ -142,9 +142,8 @@ is intentionally not shipped — a standalone `.command` can't be notarized, so
 Gatekeeper hard-blocks it on download. Windows ships a signed Inno Setup
 installer (`TagTiger-<arch>-Setup.exe`) that lets you install the GUI, the
 `tagtiger` CLI, or both — creating Start Menu/desktop shortcuts, registering
-`.mp4`/`.m4v` in "Open with", and optionally adding the CLI to your PATH — plus
-a portable `.zip` for those who prefer loose binaries. Loose macOS
-binaries are intentionally not published — Gatekeeper quarantines them, so
+`.mp4`/`.m4v` in "Open with", and optionally adding the CLI to your PATH. Loose
+macOS binaries are intentionally not published — Gatekeeper quarantines them, so
 everything ships inside the notarized `.dmg`.
 
 Releases are cut from the **Release** workflow: run it manually with a version

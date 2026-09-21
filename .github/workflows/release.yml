@@ -292,26 +292,16 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Archive (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path `
-            "target/${{ matrix.target }}/release/tagtiger.exe", `
-            "target/${{ matrix.target }}/release/tagtiger-gui.exe" `
-            -DestinationPath "dist/tagtiger-${{ matrix.target }}.zip"
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
           name: tagtiger-${{ matrix.target }}
           # Only publish finished archives/packages — never loose files (e.g.
-          # an unpacked .app bundle's internals).
+          # an unpacked .app bundle's internals). Windows ships the signed
+          # installer (.exe) only; the portable .zip has been dropped.
           path: |
             dist/*.dmg
             dist/*.tar.gz
-            dist/*.zip
             dist/*.exe
             dist/*.deb
             dist/*.rpm

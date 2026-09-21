@@ -182,6 +182,14 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
 
+        // macOS: add application:openURLs: to winit's app delegate so Finder
+        // "Open With" / dock drops / double-clicks deliver files to us. Done
+        // here (not in main) because winit's delegate class only exists once
+        // the event loop has started. The queue is drained each frame in
+        // update().
+        #[cfg(target_os = "macos")]
+        crate::macos_open::install();
+
         // Load persisted settings. When a valid license is present the startup
         // splash is suppressed; otherwise it shows for 20 seconds.
         let settings = crate::license_mgr::Settings::load();
@@ -2558,8 +2566,8 @@ mod arg_tests {
 
     #[test]
     fn non_movie_args_rejected() {
-        // A register flag or a non-movie extension is not a movie path.
-        assert!(arg_to_movie_path(OsStr::new("--register-file-types")).is_none());
+        // A CLI flag or a non-movie extension is not a movie path.
+        assert!(arg_to_movie_path(OsStr::new("--some-flag")).is_none());
         assert!(arg_to_movie_path(OsStr::new("/tmp/notes.txt")).is_none());
     }
 

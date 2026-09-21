@@ -1,16 +1,15 @@
-//! macOS "Open Documents" Apple Event handling.
+//! macOS "Open Documents" handling for Finder "Open With", dock-icon drops, and
+//! double-clicking an associated file.
 //!
-//! winit (0.30) does not forward the `application:openURLs:` /
-//! `application:openFile:` delegate callbacks that fire when a file is opened
-//! via Finder's "Open With", a dock-icon drop, or a double-click on an
-//! associated file. Those arrive as a `kCoreEventClass` / `kAEOpenDocuments`
-//! (`aevt`/`odoc`) Apple Event, not as command-line arguments.
-//!
-//! We install our own handler on the shared `NSAppleEventManager` for that
-//! event *before* the winit event loop starts, so AppKit delivers both the
-//! cold-launch event (queued until a handler exists) and later events while the
-//! app is running. Resolved file paths are pushed into a global queue that the
-//! egui update loop drains each frame.
+//! winit (0.30) installs its own `NSApplicationDelegate` but implements neither
+//! `application:openURLs:` nor `application:openFile:`, and adding those methods
+//! to winit's delegate class after the fact is not picked up by AppKit. So we
+//! register our own handler object on the shared `NSAppleEventManager` for the
+//! `kCoreEventClass`/`kAEOpenDocuments` (`aevt`/`odoc`) Apple Event. This is
+//! last-writer-wins and independent of AppKit's delegate, but must be installed
+//! *after* `NSApplication` exists (i.e. once the winit event loop is running) so
+//! it overrides AppKit's default routing. Resolved paths are queued and drained
+//! by the egui update loop each frame.
 
 #![cfg(target_os = "macos")]
 
@@ -18,32 +17,27 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Sel};
+use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager};
 
-/// Paths delivered by "Open Documents" Apple Events, awaiting the UI to pick
-/// them up. Drained by [`take_pending`] each frame.
+/// Paths delivered by open events, awaiting the UI to pick them up.
 static PENDING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-/// Apple Event constants (four-char codes) for the open-documents event.
+/// Four-char-code helpers for the open-documents Apple Event.
+const fn fourcc(t: &[u8; 4]) -> u32 {
+    ((t[0] as u32) << 24) | ((t[1] as u32) << 16) | ((t[2] as u32) << 8) | (t[3] as u32)
+}
 const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt");
 const K_AE_OPEN_DOCUMENTS: u32 = fourcc(b"odoc");
-/// The `keyDirectObject` ('----') keyword holding the event's direct object.
 const KEY_DIRECT_OBJECT: u32 = fourcc(b"----");
 
-/// Compute a big-endian four-character code from a 4-byte tag.
-const fn fourcc(tag: &[u8; 4]) -> u32 {
-    ((tag[0] as u32) << 24) | ((tag[1] as u32) << 16) | ((tag[2] as u32) << 8) | (tag[3] as u32)
-}
-
-// A minimal Objective-C object whose sole job is to carry the Apple Event
-// handler method. `NSAppleEventManager` invokes it via target+selector.
+// A small Objective-C object carrying the Apple Event handler method.
 objc2::declare_class!(
     struct OpenDocHandler;
 
     unsafe impl ClassType for OpenDocHandler {
-        type Super = objc2::runtime::NSObject;
+        type Super = NSObject;
         type Mutability = mutability::InteriorMutable;
         const NAME: &'static str = "TagTigerOpenDocHandler";
     }
@@ -51,8 +45,6 @@ objc2::declare_class!(
     impl DeclaredClass for OpenDocHandler {}
 
     unsafe impl OpenDocHandler {
-        // - (void)handleOpenDocuments:(NSAppleEventDescriptor*)event
-        //                withReplyEvent:(NSAppleEventDescriptor*)reply;
         #[method(handleOpenDocuments:withReplyEvent:)]
         unsafe fn handle_open_documents(
             &self,
@@ -64,12 +56,9 @@ objc2::declare_class!(
     }
 );
 
-/// Extract file paths from the direct object of an `odoc` Apple Event and queue
-/// them. The direct object is an AEList of file URLs / paths.
+/// Extract file paths from the `----` direct object (an AEList of file URLs).
 fn handle_event(event: &NSAppleEventDescriptor) {
     unsafe {
-        // Fetch the '----' direct-object parameter (an AEList of items). This
-        // method isn't in objc2-foundation 0.2.2's bindings, so call it raw.
         let list: Option<Retained<NSAppleEventDescriptor>> =
             msg_send_id![event, paramDescriptorForKeyword: KEY_DIRECT_OBJECT];
         let Some(list) = list else {
@@ -77,22 +66,20 @@ fn handle_event(event: &NSAppleEventDescriptor) {
         };
         let count = list.numberOfItems();
         let mut paths = Vec::new();
-        // AE lists are 1-indexed.
         for i in 1..=count {
             let Some(item) = list.descriptorAtIndex(i) else {
                 continue;
             };
-            // Coerce each item to a file-URL descriptor and read its string.
-            let furl: Option<Retained<NSAppleEventDescriptor>> =
-                msg_send_id![&item, coerceToDescriptorType: fourcc(b"furl")];
-            if let Some(url_desc) = furl {
-                if let Some(s) = url_desc.stringValue() {
-                    if let Some(p) = uri_or_path_to_pathbuf(&s.to_string()) {
-                        paths.push(p);
-                    }
+            // fileURLValue is the documented accessor for a file-URL item.
+            if let Some(url) = item.fileURLValue() {
+                if let Some(path) = url.path() {
+                    paths.push(PathBuf::from(path.to_string()));
+                    continue;
                 }
-            } else if let Some(s) = item.stringValue() {
-                if let Some(p) = uri_or_path_to_pathbuf(&s.to_string()) {
+            }
+            // Fallback: some senders provide the path/URL as a string.
+            if let Some(s) = item.stringValue() {
+                if let Some(p) = uri_or_path(&s.to_string()) {
                     paths.push(p);
                 }
             }
@@ -105,8 +92,8 @@ fn handle_event(event: &NSAppleEventDescriptor) {
     }
 }
 
-/// Turn a `file://` URL or a plain path string into a `PathBuf`.
-fn uri_or_path_to_pathbuf(s: &str) -> Option<PathBuf> {
+/// Convert a `file://` URL or plain path into a `PathBuf`.
+fn uri_or_path(s: &str) -> Option<PathBuf> {
     if let Some(rest) = s.strip_prefix("file://") {
         let rest = match rest.find('/') {
             Some(i) => &rest[i..],
@@ -120,7 +107,6 @@ fn uri_or_path_to_pathbuf(s: &str) -> Option<PathBuf> {
     }
 }
 
-/// Minimal percent-decoding (e.g. `%20` -> space) for `file://` URLs.
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -141,25 +127,32 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Install the Apple Event handler. Call once, early, before the winit loop.
+/// Install the Apple Event handler. Call once, from `App::new` (after the winit
+/// event loop / NSApplication exists), so our registration overrides AppKit's
+/// default open-documents routing.
 pub fn install() {
-    unsafe {
-        let handler: Retained<OpenDocHandler> = msg_send_id![OpenDocHandler::alloc(), init];
-        let manager = NSAppleEventManager::sharedAppleEventManager();
-        // Register handleOpenDocuments:withReplyEvent: for aevt/odoc.
-        let sel: Sel = sel!(handleOpenDocuments:withReplyEvent:);
-        let target: &AnyObject = &handler;
-        let _: () = msg_send![
-            &manager,
-            setEventHandler: target,
-            andSelector: sel,
-            forEventClass: K_CORE_EVENT_CLASS,
-            andEventID: K_AE_OPEN_DOCUMENTS,
-        ];
-        // The manager holds only a weak reference to the handler; keep it alive
-        // for the process lifetime by leaking our strong reference. (Retained
-        // isn't Send/Sync, so it can't live in a static; leaking is simplest.)
-        std::mem::forget(handler);
+    static INSTALLED: Mutex<bool> = Mutex::new(false);
+    if let Ok(mut done) = INSTALLED.lock() {
+        if *done {
+            return;
+        }
+        unsafe {
+            let handler: Retained<OpenDocHandler> = msg_send_id![OpenDocHandler::alloc(), init];
+            let manager = NSAppleEventManager::sharedAppleEventManager();
+            let sel: Sel = sel!(handleOpenDocuments:withReplyEvent:);
+            let target: &AnyObject = &handler;
+            let _: () = msg_send![
+                &manager,
+                setEventHandler: target,
+                andSelector: sel,
+                forEventClass: K_CORE_EVENT_CLASS,
+                andEventID: K_AE_OPEN_DOCUMENTS,
+            ];
+            // Leak the handler so it lives for the process lifetime (Retained
+            // isn't Send/Sync, so it can't live in a static).
+            std::mem::forget(handler);
+        }
+        *done = true;
     }
 }
 
@@ -172,11 +165,8 @@ pub fn take_pending() -> Vec<PathBuf> {
 }
 
 /// Write PNG-encoded image bytes to the general pasteboard as a standard
-/// `public.png` (`NSPasteboardTypePNG`) item, so other macOS apps (Preview,
-/// Finder, browsers) recognize it. `arboard` writes only TIFF, which some apps
-/// don't surface; this writes the widely-recognized PNG type.
-///
-/// Returns `false` if the pasteboard write failed.
+/// `public.png` (`NSPasteboardTypePNG`) item, so other macOS apps recognize it.
+/// `arboard` writes only TIFF, which some apps don't surface.
 pub fn write_pasteboard_png(png_bytes: &[u8]) -> bool {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
     use objc2_foundation::NSData;
@@ -184,7 +174,6 @@ pub fn write_pasteboard_png(png_bytes: &[u8]) -> bool {
         let data = NSData::with_bytes(png_bytes);
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
-        // setData:forType: expects the raw bytes for the given UTI type.
         let ok: bool = msg_send![&pb, setData: &*data, forType: NSPasteboardTypePNG];
         ok
     }

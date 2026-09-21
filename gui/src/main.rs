@@ -1,11 +1,17 @@
 //! egui desktop entry point for TagTiger.
+// On Windows, mark this as a GUI (windows) subsystem binary so launching it
+// does not spawn a console window. Only in release builds, so `cargo run` /
+// debug builds still show logs in a terminal.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod license;
 mod license_mgr;
 #[cfg(target_os = "macos")]
 mod macos_open;
-mod winassoc;
 mod worker;
 
 use app::App;
@@ -36,32 +42,12 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    // macOS: install the "Open Documents" Apple Event handler before the winit
-    // loop starts, so Finder "Open With" / dock drops / double-clicks (which
-    // winit does not forward) are captured — including the cold-launch event.
+    // macOS: register the Open-Documents Apple Event handler as early as
+    // possible — before the winit loop starts — so a cold-launch "Open With"
+    // (whose odoc event fires during applicationDidFinishLaunching) is caught.
+    // Re-registered in App::new too (idempotent) for the warm case.
     #[cfg(target_os = "macos")]
     macos_open::install();
-
-    // Windows file-association registration (per-user, no admin). Explicit
-    // flags let a user (or a future installer) register/unregister; otherwise
-    // we self-register idempotently on every startup so "Open with" works after
-    // first launch, since TagTiger ships without an installer.
-    #[cfg(windows)]
-    {
-        match std::env::args().nth(1).as_deref() {
-            Some("--register-file-types") => {
-                let ok = winassoc::register();
-                std::process::exit(if ok { 0 } else { 1 });
-            }
-            Some("--unregister-file-types") => {
-                let ok = winassoc::unregister();
-                std::process::exit(if ok { 0 } else { 1 });
-            }
-            _ => {
-                let _ = winassoc::register();
-            }
-        }
-    }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([980.0, 720.0])
