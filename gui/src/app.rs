@@ -1887,15 +1887,41 @@ impl App {
                     ui.label(body_text("If you enjoy using this product"));
                     ui.label(body_text("please consider donating to help"));
                     ui.label(body_text("fund this and other open source"));
+                    // Final line: "projects at <link>." — rendered as one line
+                    // with no inter-widget spacing, centered by measuring the
+                    // actual text width (the pieces are separate widgets because
+                    // only the middle one is a clickable link).
+                    let pre = "projects at ";
+                    let link = "Glowing Cat Software";
+                    let post = ".";
+                    let font = egui::FontId::proportional(14.0);
+                    let text_w = |s: &str| {
+                        ui.ctx().fonts_mut(|f| {
+                            f.layout_no_wrap(
+                                s.to_owned(),
+                                font.clone(),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
+                        })
+                    };
+                    let total_w = text_w(pre) + text_w(link) + text_w(post);
                     ui.horizontal(|ui| {
-                        // Center the "projects at <link>." line.
-                        ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
-                        ui.label(body_text("projects at"));
-                        if ui.link("Glowing Cat Software").clicked() {
+                        // Remove the default gaps between the three pieces so the
+                        // link sits flush against the surrounding text.
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let offset = ((ui.available_width() - total_w) / 2.0).max(0.0);
+                        ui.add_space(offset);
+                        ui.label(body_text(pre));
+                        if ui
+                            .link(egui::RichText::new(link).size(14.0))
+                            .clicked()
+                        {
                             link_clicked = true;
                             let _ = webbrowser_open(GLOWING_CAT_URL);
                         }
-                        ui.label(body_text("."));
+                        ui.label(body_text(post));
                     });
                     ui.add_space(12.0);
                 });
