@@ -121,12 +121,12 @@ operations.
 
 ## Platform support & packaging
 
-CI builds six targets and publishes them on tagged releases (`vX.Y.Z`):
+CI builds five targets and publishes them on tagged releases (`vX.Y.Z`):
 
 | OS      | x86-64                        | ARM64                          |
 |---------|-------------------------------|--------------------------------|
 | Linux   | `x86_64-unknown-linux-gnu`    | `aarch64-unknown-linux-gnu`    |
-| macOS   | `x86_64-apple-darwin`         | `aarch64-apple-darwin`         |
+| macOS   | — (use ARM64 via Rosetta 2)   | `aarch64-apple-darwin`         |
 | Windows | `x86_64-pc-windows-msvc`      | `aarch64-pc-windows-msvc`      |
 
 Linux releases include `.deb` and `.rpm` packages in addition to a `.tar.gz`.
