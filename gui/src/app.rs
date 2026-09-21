@@ -151,7 +151,11 @@ pub struct App {
     /// splash is visible on startup; cleared when it closes (after 20s or on
     /// click).
     splash_until: Option<std::time::Instant>,
-    /// Set when a tag-write hits the every-10th unlicensed nag. The donation
+    /// When the currently-visible splash was armed. Click-to-dismiss is ignored
+    /// until a short grace period after this, so the very click that spawns the
+    /// splash (e.g. OK on the completion dialog) doesn't instantly close it.
+    splash_shown_at: std::time::Instant,
+    /// Set when a tag-write hits the every-5th unlicensed nag. The donation
     /// splash is deferred until the user dismisses the "Update complete"
     /// dialog, so it isn't rendered underneath (and hidden by) that dialog.
     splash_pending: bool,
@@ -255,6 +259,7 @@ impl App {
             about_open: false,
             // Suppressed at startup when licensed (computed above).
             splash_until,
+            splash_shown_at: std::time::Instant::now(),
             splash_pending: false,
             settings,
             license_open: false,
@@ -1525,6 +1530,7 @@ impl eframe::App for App {
                             // 5th write) so it's actually visible on top.
                             if self.splash_pending {
                                 self.splash_pending = false;
+                                self.splash_shown_at = std::time::Instant::now();
                                 self.splash_until = Some(
                                     std::time::Instant::now()
                                         + std::time::Duration::from_secs(20),
@@ -1995,9 +2001,14 @@ impl App {
                 });
             });
 
-        // Close on a click anywhere except the donate link.
+        // Close on a click anywhere except the donate link — but ignore clicks
+        // during a short grace period after the splash is armed, so the very
+        // click that spawns it (e.g. OK on the completion dialog, or an
+        // in-progress drag) doesn't instantly dismiss it.
+        let grace = std::time::Duration::from_millis(400);
+        let past_grace = self.splash_shown_at.elapsed() >= grace;
         let clicked_anywhere = ctx.input(|i| i.pointer.any_click());
-        if clicked_anywhere && !link_clicked {
+        if past_grace && clicked_anywhere && !link_clicked {
             self.splash_until = None;
         }
     }
