@@ -149,13 +149,9 @@ jobs:
             --output dist/tagtiger-${{ matrix.target }}.rpm
 
       # ---- Package: macOS / Windows archives ----
-      - name: Archive (unix)
-        if: runner.os != 'Windows' && matrix.linux_pkg == false
-        run: |
-          mkdir -p dist
-          cd target/${{ matrix.target }}/release
-          tar czf "$GITHUB_WORKSPACE/dist/tagtiger-${{ matrix.target }}.tar.gz" \
-            tagtiger tagtiger-gui
+      # (No raw macOS binary tarball: loose executables are quarantined by
+      # Gatekeeper — "cannot verify … is free of malware". macOS ships only the
+      # notarized .dmg, which contains both the GUI app and the CLI.)
 
       # macOS: build a .app bundle (with the .icns icon) and a .dmg whose
       # mounted volume shows the application icon. When a Developer ID identity

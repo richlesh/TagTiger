@@ -36,10 +36,13 @@ echo "==> Building $APP_NAME.app ($TARGET, v$VERSION)"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 
-# GUI binary is the bundle executable; include the CLI alongside for convenience.
+# GUI binary is the bundle executable. Ship the CLI alongside it, but under a
+# name that does NOT collide with "TagTiger" case-insensitively — macOS volumes
+# are case-insensitive by default, so a file named "tagtiger" would overwrite
+# "TagTiger". Use "tagtiger-cli"; the DMG installer exposes it as `tagtiger`.
 cp "$RELEASE_DIR/tagtiger-gui" "$BUNDLE/Contents/MacOS/$APP_NAME"
 if [[ -f "$RELEASE_DIR/tagtiger" ]]; then
-  cp "$RELEASE_DIR/tagtiger" "$BUNDLE/Contents/MacOS/tagtiger"
+  cp "$RELEASE_DIR/tagtiger" "$BUNDLE/Contents/MacOS/tagtiger-cli"
 fi
 chmod +x "$BUNDLE/Contents/MacOS/$APP_NAME"
 
@@ -108,11 +111,11 @@ sign_app() {
   echo "==> Codesigning $app as: $SIGN_IDENTITY"
   # Expand KEYCHAIN_ARGS safely even when empty (bash 3.2 + set -u).
   local kc=(${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
-  if [[ -f "$app/Contents/MacOS/tagtiger" ]]; then
+  if [[ -f "$app/Contents/MacOS/tagtiger-cli" ]]; then
     codesign --force --options runtime --timestamp \
       --entitlements "$ENTITLEMENTS" \
       --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
-      "$app/Contents/MacOS/tagtiger"
+      "$app/Contents/MacOS/tagtiger-cli"
   fi
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
@@ -157,6 +160,47 @@ ditto "$BUNDLE" "$STAGING/$APP_NAME.app"
 sign_app "$STAGING/$APP_NAME.app"
 ln -s /Applications "$STAGING/Applications"
 cp "$ICNS" "$STAGING/.VolumeIcon.icns"
+
+# CLI installer: a double-clickable script that symlinks the `tagtiger` CLI
+# (which ships inside the notarized app at Contents/MacOS/tagtiger-cli) onto the
+# user's PATH at /usr/local/bin/tagtiger. Because the symlink target lives
+# inside the notarized .app, the CLI runs without Gatekeeper quarantine issues.
+INSTALLER="$STAGING/Install tagtiger CLI.command"
+cat >"$INSTALLER" <<'CMD'
+#!/bin/bash
+# Symlink the TagTiger CLI onto your PATH. Run this after copying TagTiger.app
+# to your Applications folder.
+set -e
+APP="/Applications/TagTiger.app/Contents/MacOS/tagtiger-cli"
+DEST="/usr/local/bin/tagtiger"
+
+if [ ! -x "$APP" ]; then
+  echo "TagTiger.app was not found in /Applications."
+  echo "Drag TagTiger.app to Applications first, then run this again."
+  read -n 1 -s -r -p "Press any key to close..."
+  exit 1
+fi
+
+echo "Linking $DEST -> $APP"
+if [ -w "/usr/local/bin" ] || mkdir -p /usr/local/bin 2>/dev/null; then
+  ln -sf "$APP" "$DEST"
+else
+  echo "Administrator access is required to write to /usr/local/bin."
+  sudo mkdir -p /usr/local/bin
+  sudo ln -sf "$APP" "$DEST"
+fi
+
+echo "Done. You can now run: tagtiger --help"
+read -n 1 -s -r -p "Press any key to close..."
+CMD
+chmod +x "$INSTALLER"
+# Sign the installer script too when a signing identity is available (loose
+# scripts are otherwise unsigned; signing keeps Gatekeeper happy).
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  installer_kc=(${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
+  codesign --force --timestamp --sign "$SIGN_IDENTITY" \
+    ${installer_kc[@]+"${installer_kc[@]}"} "$INSTALLER" || true
+fi
 
 echo "==> Creating writable image"
 hdiutil create \
