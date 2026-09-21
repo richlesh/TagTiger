@@ -127,32 +127,22 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Install the Apple Event handler. Call once, from `App::new` (after the winit
-/// event loop / NSApplication exists), so our registration overrides AppKit's
-/// default open-documents routing.
+/// Install the Apple Event handler. Registers (or re-registers) our
+/// open-documents handler on the shared NSAppleEventManager.
 pub fn install() {
-    static INSTALLED: Mutex<bool> = Mutex::new(false);
-    if let Ok(mut done) = INSTALLED.lock() {
-        if *done {
-            return;
-        }
-        unsafe {
-            let handler: Retained<OpenDocHandler> = msg_send_id![OpenDocHandler::alloc(), init];
-            let manager = NSAppleEventManager::sharedAppleEventManager();
-            let sel: Sel = sel!(handleOpenDocuments:withReplyEvent:);
-            let target: &AnyObject = &handler;
-            let _: () = msg_send![
-                &manager,
-                setEventHandler: target,
-                andSelector: sel,
-                forEventClass: K_CORE_EVENT_CLASS,
-                andEventID: K_AE_OPEN_DOCUMENTS,
-            ];
-            // Leak the handler so it lives for the process lifetime (Retained
-            // isn't Send/Sync, so it can't live in a static).
-            std::mem::forget(handler);
-        }
-        *done = true;
+    unsafe {
+        let handler: Retained<OpenDocHandler> = msg_send_id![OpenDocHandler::alloc(), init];
+        let manager = NSAppleEventManager::sharedAppleEventManager();
+        let sel: Sel = sel!(handleOpenDocuments:withReplyEvent:);
+        let target: &AnyObject = &handler;
+        let _: () = msg_send![
+            &manager,
+            setEventHandler: target,
+            andSelector: sel,
+            forEventClass: K_CORE_EVENT_CLASS,
+            andEventID: K_AE_OPEN_DOCUMENTS,
+        ];
+        std::mem::forget(handler);
     }
 }
 

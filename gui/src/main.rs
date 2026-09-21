@@ -42,10 +42,9 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    // macOS: register the Open-Documents Apple Event handler as early as
-    // possible — before the winit loop starts — so a cold-launch "Open With"
-    // (whose odoc event fires during applicationDidFinishLaunching) is caught.
-    // Re-registered in App::new too (idempotent) for the warm case.
+    // macOS: register the Open-Documents Apple Event handler so "Open With" /
+    // dock drops onto an already-running app deliver the file. (Cold-launch
+    // Open With is a known winit limitation; see macos_open.)
     #[cfg(target_os = "macos")]
     macos_open::install();
 

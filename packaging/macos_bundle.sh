@@ -40,11 +40,22 @@ mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 # name that does NOT collide with "TagTiger" case-insensitively — macOS volumes
 # are case-insensitive by default, so a file named "tagtiger" would overwrite
 # "TagTiger". Use "tagtiger-cli"; the DMG installer exposes it as `tagtiger`.
-cp "$RELEASE_DIR/tagtiger-gui" "$BUNDLE/Contents/MacOS/$APP_NAME"
+# The bundle executable is the launcher shim (named "$APP_NAME"): it captures
+# Finder "Open With"/dock-drop/double-click files (which winit doesn't forward
+# on cold launch) and re-execs the GUI with them as arguments. The GUI and CLI
+# ship alongside it. Names must not collide case-insensitively with "TagTiger"
+# on the case-insensitive DMG volume, so we use "tagtiger-gui"/"tagtiger-cli".
+if [[ -f "$RELEASE_DIR/tagtiger-launch" ]]; then
+  cp "$RELEASE_DIR/tagtiger-launch" "$BUNDLE/Contents/MacOS/$APP_NAME"
+else
+  # Fallback (no launcher built): GUI is the executable directly.
+  cp "$RELEASE_DIR/tagtiger-gui" "$BUNDLE/Contents/MacOS/$APP_NAME"
+fi
+cp "$RELEASE_DIR/tagtiger-gui" "$BUNDLE/Contents/MacOS/tagtiger-gui"
 if [[ -f "$RELEASE_DIR/tagtiger" ]]; then
   cp "$RELEASE_DIR/tagtiger" "$BUNDLE/Contents/MacOS/tagtiger-cli"
 fi
-chmod +x "$BUNDLE/Contents/MacOS/$APP_NAME"
+chmod +x "$BUNDLE/Contents/MacOS/$APP_NAME" "$BUNDLE/Contents/MacOS/tagtiger-gui"
 
 cp "$ICNS" "$BUNDLE/Contents/Resources/app_icon.icns"
 
@@ -138,6 +149,12 @@ sign_app() {
       --entitlements "$ENTITLEMENTS" \
       --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
       "$app/Contents/MacOS/tagtiger-cli"
+  fi
+  if [[ -f "$app/Contents/MacOS/tagtiger-gui" ]]; then
+    codesign --force --options runtime --timestamp \
+      --entitlements "$ENTITLEMENTS" \
+      --sign "$SIGN_IDENTITY" ${kc[@]+"${kc[@]}"} \
+      "$app/Contents/MacOS/tagtiger-gui"
   fi
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
