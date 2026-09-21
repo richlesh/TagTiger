@@ -171,6 +171,11 @@ jobs:
           packaging/macos_bundle.sh ${{ matrix.target }} dist
           # Archive the .app bundle too (preserves the executable bit).
           tar czf "dist/tagtiger-${{ matrix.target }}-app.tar.gz" -C dist TagTiger.app
+          # Remove the unpacked bundle so the artifact upload (dist/*) doesn't
+          # recurse into TagTiger.app and publish its internal files
+          # (Info.plist, CodeResources, the raw executable, app_icon.icns) as
+          # loose release assets. The .dmg and -app.tar.gz already contain it.
+          rm -rf dist/TagTiger.app
 
       # Sign the DMG, submit it for notarization, and staple the ticket so the
       # download runs on Gatekeeper without a network check. Skipped when the
@@ -261,7 +266,15 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: tagtiger-${{ matrix.target }}
-          path: dist/*
+          # Only publish finished archives/packages — never loose files (e.g.
+          # an unpacked .app bundle's internals).
+          path: |
+            dist/*.dmg
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: ignore
 
   release:
     name: Publish release
