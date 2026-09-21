@@ -34,6 +34,21 @@ jobs:
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
             libxi-dev libgl1-mesa-dev libxkbcommon-dev
 
+      # gui/src/license.rs holds the license salt and is git-ignored, so it's
+      # absent on a fresh checkout. build.rs regenerates it for `cargo build`,
+      # but `cargo fmt` does not run build scripts and would fail to resolve
+      # `mod license;`. Create it here (from the LICENSE_SALT secret, or a
+      # placeholder) so fmt/clippy/test can all resolve the module.
+      - name: Generate gui/src/license.rs
+        shell: bash
+        env:
+          LICENSE_SALT: ${{ secrets.LICENSE_SALT }}
+        run: |
+          if [ ! -f gui/src/license.rs ]; then
+            SALT="${LICENSE_SALT:-UNSET-BUILD-SALT}"
+            printf 'pub const LICENSE_SALT: &str = "%s";\n' "$SALT" > gui/src/license.rs
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 

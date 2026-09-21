@@ -581,7 +581,10 @@ mod tests {
         let xml = build_itunmovi_plist(&meta).unwrap();
         let people = parse_itunmovi_people(&xml);
         let names = |v: &[Person]| v.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
-        assert_eq!(names(&people.cast), vec!["Keanu Reeves", "Carrie-Anne Moss"]);
+        assert_eq!(
+            names(&people.cast),
+            vec!["Keanu Reeves", "Carrie-Anne Moss"]
+        );
         assert_eq!(names(&people.directors), vec!["Lana Wachowski"]);
         // These two were previously dropped on read — the bug this fixes.
         assert_eq!(names(&people.producers), vec!["Joel Silver"]);

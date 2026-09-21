@@ -556,7 +556,10 @@ mod tests {
 
         let mut prog = |_: u64, _: u64| {};
         let normalized = normalize_moov_last(&src, &dst, &mut prog).unwrap();
-        assert!(normalized, "normalization should apply to a moov-first file");
+        assert!(
+            normalized,
+            "normalization should apply to a moov-first file"
+        );
 
         // Postcondition: moov now comes after mdat, so a subsequent write takes
         // the in-place path.

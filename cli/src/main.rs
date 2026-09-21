@@ -118,7 +118,14 @@ fn inspect(file: PathBuf) -> Result<()> {
     };
     let opt = |o: &Option<String>| o.clone().unwrap_or_else(|| "(none)".into());
 
-    println!("Title:        {}", if meta.title.is_empty() { "(none)".into() } else { meta.title.clone() });
+    println!(
+        "Title:        {}",
+        if meta.title.is_empty() {
+            "(none)".into()
+        } else {
+            meta.title.clone()
+        }
+    );
     println!(
         "Release date: {}",
         meta.release_date

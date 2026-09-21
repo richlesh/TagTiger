@@ -386,9 +386,8 @@ impl App {
                     self.settings.tag_count = self.settings.tag_count.wrapping_add(1);
                     let _ = self.settings.save();
                     if !self.settings.is_licensed() && self.settings.tag_count % 10 == 0 {
-                        self.splash_until = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(20),
-                        );
+                        self.splash_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
                     }
                 }
                 Event::WriteStarted => {
@@ -1809,7 +1808,10 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(title_text("TagTiger"));
                     ui.add_space(6.0);
-                    ui.label(muted_text(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    ui.label(muted_text(&format!(
+                        "Version {}",
+                        env!("CARGO_PKG_VERSION")
+                    )));
                     ui.label(muted_text("©2026 Richard Lesh"));
                     ui.label(muted_text(&format!("Built with egui v{EGUI_VERSION}")));
                     ui.add_space(2.0);
@@ -1882,7 +1884,10 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(title_text("TagTiger"));
                     ui.add_space(4.0);
-                    ui.label(muted_text(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
+                    ui.label(muted_text(&format!(
+                        "Version {}",
+                        env!("CARGO_PKG_VERSION")
+                    )));
                     ui.add_space(8.0);
                     ui.label(body_text("If you enjoy using this product"));
                     ui.label(body_text("please consider donating to help"));
@@ -1897,13 +1902,9 @@ impl App {
                     let font = egui::FontId::proportional(14.0);
                     let text_w = |s: &str| {
                         ui.ctx().fonts_mut(|f| {
-                            f.layout_no_wrap(
-                                s.to_owned(),
-                                font.clone(),
-                                egui::Color32::WHITE,
-                            )
-                            .size()
-                            .x
+                            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                                .size()
+                                .x
                         })
                     };
                     let total_w = text_w(pre) + text_w(link) + text_w(post);
@@ -1914,10 +1915,7 @@ impl App {
                         let offset = ((ui.available_width() - total_w) / 2.0).max(0.0);
                         ui.add_space(offset);
                         ui.label(body_text(pre));
-                        if ui
-                            .link(egui::RichText::new(link).size(14.0))
-                            .clicked()
-                        {
+                        if ui.link(egui::RichText::new(link).size(14.0)).clicked() {
                             link_clicked = true;
                             let _ = webbrowser_open(GLOWING_CAT_URL);
                         }
@@ -2003,10 +2001,7 @@ impl App {
                     if ui.button("Cancel").clicked() {
                         do_cancel = true;
                     }
-                    if ui
-                        .add_enabled(valid, egui::Button::new("Save"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(valid, egui::Button::new("Save")).clicked() {
                         do_save = true;
                     }
                 });
@@ -2019,8 +2014,7 @@ impl App {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        if enter
-            && crate::license_mgr::is_valid(&self.license_key_input, &self.license_email_input)
+        if enter && crate::license_mgr::is_valid(&self.license_key_input, &self.license_email_input)
         {
             do_save = true;
         }
@@ -2030,8 +2024,7 @@ impl App {
 
         if do_save {
             self.settings.license_email = self.license_email_input.trim().to_string();
-            self.settings.license_key =
-                crate::license_mgr::normalize_key(&self.license_key_input);
+            self.settings.license_key = crate::license_mgr::normalize_key(&self.license_key_input);
             match self.settings.save() {
                 Ok(()) => {
                     self.status = "License saved. Thank you!".into();
@@ -2097,7 +2090,10 @@ fn muted_text(s: &str) -> egui::RichText {
 fn webbrowser_open(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn().map(|_| ())
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
@@ -2108,7 +2104,10 @@ fn webbrowser_open(url: &str) -> std::io::Result<()> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
     }
 }
 

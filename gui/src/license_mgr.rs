@@ -28,7 +28,10 @@ pub fn expected_key(email: &str) -> String {
     mac.update(email.to_lowercase().trim().as_bytes());
     let digest = mac.finalize().into_bytes();
     // Hex-encode, take the first 16 hex chars, uppercase.
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     hex[..16].to_uppercase()
 }
 
@@ -118,7 +121,9 @@ mod tests {
     fn expected_key_is_16_upper_hex() {
         let k = expected_key("user@example.com");
         assert_eq!(k.len(), 16);
-        assert!(k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()));
+        assert!(k
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()));
     }
 
     #[test]
