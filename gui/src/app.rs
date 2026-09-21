@@ -129,7 +129,6 @@ pub struct App {
     edit_fast_start: bool,
     /// Selected video definition (`hdvd`) and its lock.
     edit_definition: Option<Definition>,
-    lock_definition: bool,
     /// Detected video track dimensions (width, height) of the opened file.
     video_dimensions: Option<(u32, u32)>,
     /// Progress of an ongoing shift-save: (bytes_done, bytes_total).
@@ -249,7 +248,6 @@ impl App {
             lock_video_kind: false,
             edit_fast_start: false,
             edit_definition: None,
-            lock_definition: false,
             video_dimensions: None,
             write_progress: None,
             write_done_msg: None,
@@ -271,10 +269,11 @@ impl App {
             no_credential_open: false,
         };
 
-        // If launched with a movie file argument (e.g. Finder "Open With" or
-        // `open -a TagTiger movie.mp4`), open it immediately.
-        if let Some(path) = std::env::args_os().nth(1).map(std::path::PathBuf::from) {
-            if is_movie_path(&path) && path.exists() {
+        // If launched with a movie file argument — Finder "Open With"/`open -a`
+        // on macOS, a `%U` handoff from the Linux .desktop association (which
+        // may be a file:// URI), or a path on the command line — open it.
+        if let Some(arg) = std::env::args_os().nth(1) {
+            if let Some(path) = arg_to_movie_path(&arg) {
                 let _ = app.worker.tx.send(Request::OpenFile { path });
             }
         }
@@ -663,7 +662,11 @@ impl App {
         if !(respect_locks && self.lock_video_kind) {
             self.edit_video_kind = meta.video_kind;
         }
-        if !(respect_locks && self.lock_definition) {
+        // Definition is only set on the initial file load. Selecting a TMDB
+        // match must never change it — the definition comes from the file (or
+        // the video track's dimensions), not from the chosen match — so it is
+        // left untouched whenever `respect_locks` is true.
+        if !respect_locks {
             self.edit_definition = meta.definition;
         }
         if !(respect_locks && self.lock_year) {
@@ -800,6 +803,46 @@ fn ext_lower(path: &std::path::Path) -> Option<String> {
 /// Whether a path looks like a taggable movie file.
 fn is_movie_path(path: &std::path::Path) -> bool {
     matches!(ext_lower(path).as_deref(), Some("mp4") | Some("m4v"))
+}
+
+/// Convert a launch argument — a plain path or a `file://` URI (as delivered
+/// by the Linux `.desktop` `%U` field) — into a movie path that exists on disk.
+/// Returns `None` if it isn't a real, taggable movie file.
+fn arg_to_movie_path(arg: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let s = arg.to_string_lossy();
+    let path = if let Some(rest) = s.strip_prefix("file://") {
+        // Drop an optional authority (e.g. localhost) before the first '/'.
+        let rest = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => rest,
+        };
+        std::path::PathBuf::from(percent_decode(rest))
+    } else {
+        std::path::PathBuf::from(arg)
+    };
+    (is_movie_path(&path) && path.exists()).then_some(path)
+}
+
+/// Minimal percent-decoding for `file://` URIs (e.g. `%20` -> space). Invalid
+/// escapes are left as-is. Avoids pulling in a URL-parsing dependency.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a path looks like an image file (for poster replacement).
@@ -1190,40 +1233,39 @@ impl eframe::App for App {
                                          mdat.",
                                     );
                             });
-                            // Definition: SD / HD 720p / HD 1080p / 4K.
+                            // Definition: SD / HD 720p / HD 1080p / 4K. Always
+                            // editable — selecting a TMDB match never changes it,
+                            // so there is no lock checkbox for this field.
                             ui.horizontal(|ui| {
                                 right_label(ui, "Definition", LABEL_W);
-                                ui.add_enabled_ui(!self.lock_definition, |ui| {
-                                    let current = self
-                                        .edit_definition
-                                        .map(|d| d.label())
-                                        .unwrap_or("(none)");
-                                    egui::ComboBox::from_id_salt("definition")
-                                        .selected_text(current)
-                                        .show_ui(ui, |ui| {
+                                let current = self
+                                    .edit_definition
+                                    .map(|d| d.label())
+                                    .unwrap_or("(none)");
+                                egui::ComboBox::from_id_salt("definition")
+                                    .selected_text(current)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.edit_definition.is_none(),
+                                                "(none)",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.edit_definition = None;
+                                        }
+                                        for d in Definition::all() {
                                             if ui
                                                 .selectable_label(
-                                                    self.edit_definition.is_none(),
-                                                    "(none)",
+                                                    self.edit_definition == Some(*d),
+                                                    d.label(),
                                                 )
                                                 .clicked()
                                             {
-                                                self.edit_definition = None;
+                                                self.edit_definition = Some(*d);
                                             }
-                                            for d in Definition::all() {
-                                                if ui
-                                                    .selectable_label(
-                                                        self.edit_definition == Some(*d),
-                                                        d.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.edit_definition = Some(*d);
-                                                }
-                                            }
-                                        });
-                                });
-                                ui.checkbox(&mut self.lock_definition, "Lock");
+                                        }
+                                    });
                                 if let Some((w, h)) = self.video_dimensions {
                                     ui.label(format!("{w} x {h}"));
                                 }
@@ -2470,4 +2512,44 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
         .write_to(&mut out, image::ImageFormat::Png)
         .ok()?;
     Some(out.into_inner())
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::{arg_to_movie_path, percent_decode};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("plain"), "plain");
+        // Invalid escapes are preserved.
+        assert_eq!(percent_decode("100%done"), "100%done");
+        assert_eq!(percent_decode("%2Fetc%2Ffile"), "/etc/file");
+    }
+
+    #[test]
+    fn non_movie_args_rejected() {
+        // A register flag or a non-movie extension is not a movie path.
+        assert!(arg_to_movie_path(OsStr::new("--register-file-types")).is_none());
+        assert!(arg_to_movie_path(OsStr::new("/tmp/notes.txt")).is_none());
+    }
+
+    #[test]
+    fn movie_arg_and_uri_resolve_to_existing_file() {
+        // Create a temp .mp4 and check both a plain path and a file:// URI
+        // (with a percent-encoded space) resolve to it.
+        let dir = std::env::temp_dir();
+        let file = dir.join("tag tiger test.mp4");
+        std::fs::write(&file, b"x").unwrap();
+
+        let plain = arg_to_movie_path(file.as_os_str());
+        assert_eq!(plain.as_deref(), Some(file.as_path()));
+
+        let uri = format!("file://{}", file.to_string_lossy().replace(' ', "%20"));
+        let from_uri = arg_to_movie_path(OsStr::new(&uri));
+        assert_eq!(from_uri.as_deref(), Some(file.as_path()));
+
+        let _ = std::fs::remove_file(&file);
+    }
 }

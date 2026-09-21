@@ -15,6 +15,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Run JavaScript-based actions on Node.js 24. The v5 artifact actions (and
+  # some others) still bundle a Node.js 20 runtime, which GitHub is
+  # deprecating; opting in now silences the warning and is forward-compatible.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
   contents: write

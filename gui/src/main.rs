@@ -3,6 +3,7 @@
 mod app;
 mod license;
 mod license_mgr;
+mod winassoc;
 mod worker;
 
 use app::App;
@@ -26,6 +27,27 @@ fn main() -> eframe::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Windows file-association registration (per-user, no admin). Explicit
+    // flags let a user (or a future installer) register/unregister; otherwise
+    // we self-register idempotently on every startup so "Open with" works after
+    // first launch, since TagTiger ships without an installer.
+    #[cfg(windows)]
+    {
+        match std::env::args().nth(1).as_deref() {
+            Some("--register-file-types") => {
+                let ok = winassoc::register();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            Some("--unregister-file-types") => {
+                let ok = winassoc::unregister();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            _ => {
+                let _ = winassoc::register();
+            }
+        }
+    }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([980.0, 720.0])

@@ -2,7 +2,8 @@
 Type=Application
 Name=TagTiger
 Comment=Tag MP4/M4V files with movie and TV metadata
-Exec=tagtiger-gui
+Exec=tagtiger-gui %U
 Icon=tagtiger
 Terminal=false
 Categories=AudioVideo;Video;Utility;
+MimeType=video/mp4;video/x-m4v;

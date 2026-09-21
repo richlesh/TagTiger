@@ -63,6 +63,28 @@ cat >"$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>        <string>app_icon</string>
     <key>LSMinimumSystemVersion</key>  <string>10.13</string>
     <key>NSHighResolutionCapable</key> <true/>
+    <!-- File associations: advertise TagTiger as an opener for MP4/M4V so it
+         appears in Finder's "Open With" / Get Info and accepts dock/Finder
+         drops. Declared by both system UTI and extension for robustness. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleTypeName</key>        <string>MPEG-4 Movie</string>
+        <key>CFBundleTypeRole</key>        <string>Editor</string>
+        <key>LSHandlerRank</key>           <string>Alternate</string>
+        <key>LSItemContentTypes</key>
+        <array>
+          <string>public.mpeg-4</string>
+          <string>com.apple.m4v-video</string>
+        </array>
+        <key>CFBundleTypeExtensions</key>
+        <array>
+          <string>mp4</string>
+          <string>m4v</string>
+        </array>
+        <key>CFBundleTypeIconFile</key>     <string>app_icon</string>
+      </dict>
+    </array>
 </dict>
 </plist>
 PLIST
