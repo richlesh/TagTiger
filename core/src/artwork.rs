@@ -63,20 +63,22 @@ pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     Ok(reader.into_dimensions()?)
 }
 
-/// Maximum cover-art height in pixels. Larger images are downscaled (keeping
-/// aspect ratio) so the embedded `covr` stays small.
-pub const MAX_COVER_HEIGHT: u32 = 1000;
+/// Maximum cover-art dimension (width or height) in pixels. Larger images are
+/// downscaled to fit within a `MAX_COVER_DIMENSION` × `MAX_COVER_DIMENSION` box
+/// (keeping aspect ratio) so the embedded `covr` stays small.
+pub const MAX_COVER_DIMENSION: u32 = 1000;
 
 /// Normalize downloaded artwork bytes into a format accepted by the `covr`
-/// atom, clamping the height to [`MAX_COVER_HEIGHT`] (aspect preserved).
+/// atom, clamping both width and height to [`MAX_COVER_DIMENSION`] (aspect
+/// ratio preserved).
 ///
-/// - If the image is within the height limit and already JPEG or PNG, its
+/// - If the image is within the size limit and already JPEG or PNG, its
 ///   bytes are passed through unchanged.
 /// - Otherwise it is downscaled as needed and re-encoded to JPEG.
 pub fn normalize_for_cover(bytes: &[u8]) -> Result<EncodedArtwork> {
     let format = image::guess_format(bytes).ok();
     let within_limit = match dimensions(bytes) {
-        Ok((_, h)) => h <= MAX_COVER_HEIGHT,
+        Ok((w, h)) => w <= MAX_COVER_DIMENSION && h <= MAX_COVER_DIMENSION,
         // If we can't read dimensions, fall through to a decode/re-encode.
         Err(_) => false,
     };
@@ -101,11 +103,13 @@ pub fn normalize_for_cover(bytes: &[u8]) -> Result<EncodedArtwork> {
 
     // Needs downscaling and/or re-encoding.
     let img = image::load_from_memory(bytes)?;
-    let scaled = if img.height() > MAX_COVER_HEIGHT {
-        // Preserve aspect ratio: bound the height, let width scale with it.
+    let scaled = if img.width() > MAX_COVER_DIMENSION || img.height() > MAX_COVER_DIMENSION {
+        // `resize` fits the image *within* the given box, preserving aspect
+        // ratio — so bounding both to MAX_COVER_DIMENSION clamps the larger
+        // dimension and scales the other proportionally.
         img.resize(
-            u32::MAX,
-            MAX_COVER_HEIGHT,
+            MAX_COVER_DIMENSION,
+            MAX_COVER_DIMENSION,
             image::imageops::FilterType::Lanczos3,
         )
     } else {
@@ -117,4 +121,50 @@ pub fn normalize_for_cover(bytes: &[u8]) -> Result<EncodedArtwork> {
         format: ArtworkFormat::Jpeg,
         bytes: out.into_inner(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode a solid RGBA image of the given size as PNG bytes.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn clamps_tall_image_to_max_dimension() {
+        // 800 x 2000 -> height is the binding dimension.
+        let (w, h) = dimensions(&normalize_for_cover(&png(800, 2000)).unwrap().bytes).unwrap();
+        assert!(
+            w <= MAX_COVER_DIMENSION && h <= MAX_COVER_DIMENSION,
+            "{w}x{h}"
+        );
+        assert_eq!(h, MAX_COVER_DIMENSION); // scaled to fit height
+        assert_eq!(w, 400); // aspect ratio preserved (800*1000/2000)
+    }
+
+    #[test]
+    fn clamps_wide_image_to_max_dimension() {
+        // 2000 x 800 -> width is the binding dimension (previously NOT clamped).
+        let (w, h) = dimensions(&normalize_for_cover(&png(2000, 800)).unwrap().bytes).unwrap();
+        assert!(
+            w <= MAX_COVER_DIMENSION && h <= MAX_COVER_DIMENSION,
+            "{w}x{h}"
+        );
+        assert_eq!(w, MAX_COVER_DIMENSION); // scaled to fit width
+        assert_eq!(h, 400); // aspect ratio preserved (800*1000/2000)
+    }
+
+    #[test]
+    fn passes_through_small_image() {
+        // Within limits: dimensions unchanged.
+        let (w, h) = dimensions(&normalize_for_cover(&png(600, 900)).unwrap().bytes).unwrap();
+        assert_eq!((w, h), (600, 900));
+    }
 }
