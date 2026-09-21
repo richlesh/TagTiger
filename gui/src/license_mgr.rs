@@ -82,6 +82,10 @@ pub struct Settings {
     /// every N writes.
     #[serde(default)]
     pub tag_count: u64,
+    /// TMDB v4 read access token (Bearer). When set, it takes precedence over
+    /// the `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables.
+    #[serde(default)]
+    pub tmdb_bearer_token: String,
 }
 
 impl Settings {

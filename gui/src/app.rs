@@ -151,6 +151,10 @@ pub struct App {
     /// splash is visible on startup; cleared when it closes (after 20s or on
     /// click).
     splash_until: Option<std::time::Instant>,
+    /// Set when a tag-write hits the every-10th unlicensed nag. The donation
+    /// splash is deferred until the user dismisses the "Update complete"
+    /// dialog, so it isn't rendered underneath (and hidden by) that dialog.
+    splash_pending: bool,
 
     /// Persisted settings (license + tag counter), loaded at startup.
     settings: crate::license_mgr::Settings,
@@ -162,21 +166,34 @@ pub struct App {
     license_key_input: String,
     /// Transient status message shown in the License Key dialog.
     license_msg: String,
+    /// True while the Settings dialog is open.
+    settings_open: bool,
+    /// TMDB Bearer token input in the Settings dialog.
+    settings_token_input: String,
+    /// True while the "TMDB credential required" message dialog is open
+    /// (shown when a search is attempted without any TMDB credential).
+    no_credential_open: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let worker = Worker::spawn(move || ctx.request_repaint());
 
         // Load persisted settings. When a valid license is present the startup
         // splash is suppressed; otherwise it shows for 20 seconds.
         let settings = crate::license_mgr::Settings::load();
+        let worker = Worker::spawn(settings.tmdb_bearer_token.clone(), move || {
+            ctx.request_repaint()
+        });
+
         let splash_until = if settings.is_licensed() {
             None
         } else {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(20))
         };
+
+        // Prefill the Settings dialog's token field with the saved value.
+        let token_input = settings.tmdb_bearer_token.clone();
 
         let app = Self {
             worker,
@@ -238,11 +255,15 @@ impl App {
             about_open: false,
             // Suppressed at startup when licensed (computed above).
             splash_until,
+            splash_pending: false,
             settings,
             license_open: false,
             license_email_input: String::new(),
             license_key_input: String::new(),
             license_msg: String::new(),
+            settings_open: false,
+            settings_token_input: token_input,
+            no_credential_open: false,
         };
 
         // If launched with a movie file argument (e.g. Finder "Open With" or
@@ -382,12 +403,14 @@ impl App {
 
                     // Count each successful tag-write and persist it. For
                     // unlicensed users, show the donation splash for 20s every
-                    // 10th write. Licensed users are never nagged.
+                    // 5th write. Licensed users are never nagged.
                     self.settings.tag_count = self.settings.tag_count.wrapping_add(1);
                     let _ = self.settings.save();
-                    if !self.settings.is_licensed() && self.settings.tag_count % 10 == 0 {
-                        self.splash_until =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                    if !self.settings.is_licensed() && self.settings.tag_count % 5 == 0 {
+                        // Defer the splash until the user dismisses the
+                        // "Update complete" dialog; otherwise the splash renders
+                        // underneath that dialog and can't be seen.
+                        self.splash_pending = true;
                     }
                 }
                 Event::WriteStarted => {
@@ -925,6 +948,11 @@ impl eframe::App for App {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        self.open_settings_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         ui.close();
@@ -982,6 +1010,14 @@ impl eframe::App for App {
                     if ui.button("License Key…").clicked() {
                         self.open_license_dialog();
                         ui.close();
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        ui.separator();
+                        if ui.button("Install Command-Line Tool…").clicked() {
+                            self.install_cli();
+                            ui.close();
+                        }
                     }
                     ui.separator();
                     if ui.button("About TagTiger").clicked() {
@@ -1484,6 +1520,16 @@ impl eframe::App for App {
                     ui.vertical_centered(|ui| {
                         if ui.button("OK").clicked() {
                             self.write_done_msg = None;
+                            // Now that the completion dialog is dismissed, show
+                            // the deferred donation splash (unlicensed, every
+                            // 5th write) so it's actually visible on top.
+                            if self.splash_pending {
+                                self.splash_pending = false;
+                                self.splash_until = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(20),
+                                );
+                            }
                         }
                     });
                 });
@@ -1493,6 +1539,8 @@ impl eframe::App for App {
         // they sit on top of everything else.
         self.about_window(&ctx);
         self.license_window(&ctx);
+        self.settings_window(&ctx);
+        self.no_credential_window(&ctx);
         self.splash_window(&ctx);
     }
 }
@@ -1736,8 +1784,30 @@ impl App {
             self.status = "Enter a title to search.".into();
             return;
         }
+        // TMDB searches need a credential. If neither a saved token nor an
+        // environment variable is configured, prompt the user to set one up
+        // rather than firing a request that would just error.
+        if !self.has_tmdb_credential() {
+            self.no_credential_open = true;
+            return;
+        }
         self.status = format!("Searching for “{query}”…");
         let _ = self.worker.tx.send(Request::Search { query });
+    }
+
+    /// Whether a TMDB credential is available: a saved Bearer token, or one of
+    /// the `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables. This
+    /// mirrors the worker's provider-construction logic.
+    fn has_tmdb_credential(&self) -> bool {
+        if !self.settings.tmdb_bearer_token.trim().is_empty() {
+            return true;
+        }
+        let env_set = |k: &str| {
+            std::env::var(k)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        };
+        env_set("TMDB_BEARER_TOKEN") || env_set("TMDB_API_KEY")
     }
 
     fn write_tags(&mut self) {
@@ -2050,12 +2120,262 @@ impl App {
         self.license_msg.clear();
         self.license_open = true;
     }
+
+    /// Open the Settings dialog, prefilling the saved TMDB Bearer token.
+    fn open_settings_dialog(&mut self) {
+        self.settings_token_input = self.settings.tmdb_bearer_token.clone();
+        self.settings_open = true;
+    }
+
+    /// Settings dialog: enter a TMDB v4 read access token (Bearer). Saving
+    /// persists it to settings and hands it to the worker so subsequent TMDB
+    /// requests authenticate with it.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        let mut do_cancel = false;
+
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(title_text("Settings"));
+                    ui.add_space(8.0);
+                });
+
+                ui.label(body_text("TMDB Bearer Token"));
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_token_input)
+                        .hint_text("Paste your v4 read access token")
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                ui.hyperlink_to(
+                    "To get a TMDB API Read Access Token…",
+                    TMDB_API_SETTINGS_URL,
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                });
+            });
+
+        // Enter saves; Escape cancels.
+        let (enter, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if do_save || enter {
+            let token = self.settings_token_input.trim().to_string();
+            self.settings.tmdb_bearer_token = token.clone();
+            match self.settings.save() {
+                Ok(()) => self.status = "TMDB token saved.".into(),
+                Err(e) => self.status = format!("Failed to save settings: {e}"),
+            }
+            // Hand the new credential to the worker (empty clears it, falling
+            // back to environment variables).
+            let _ = self.worker.tx.send(Request::SetBearerToken(token));
+            self.settings_open = false;
+        } else if do_cancel || escape || !open {
+            self.settings_open = false;
+        }
+    }
+
+    /// Message dialog shown when a TMDB search is attempted without any
+    /// credential configured. Offers a shortcut into the Settings dialog.
+    fn no_credential_window(&mut self, ctx: &egui::Context) {
+        if !self.no_credential_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_ok = false;
+        let mut do_settings = false;
+
+        egui::Window::new("TMDB credential required")
+            .id(egui::Id::new("no_credential"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(title_text("TMDB credential required"));
+                    ui.add_space(8.0);
+                });
+                ui.label(body_text(
+                    "A TMDB account and API Read Access Token are required \
+                     for TMDB searches.",
+                ));
+                ui.add_space(6.0);
+                ui.label(body_text(
+                    "Configure your TMDB Read Access Token in the Settings dialog.",
+                ));
+                ui.add_space(6.0);
+                ui.hyperlink_to(
+                    "To get a TMDB API Read Access Token…",
+                    TMDB_API_SETTINGS_URL,
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        do_ok = true;
+                    }
+                    if ui.button("Open Settings…").clicked() {
+                        do_settings = true;
+                    }
+                });
+            });
+
+        let (enter, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if do_settings {
+            self.no_credential_open = false;
+            self.open_settings_dialog();
+        } else if do_ok || enter || escape || !open {
+            self.no_credential_open = false;
+        }
+    }
+
+    /// Install the `tagtiger` CLI onto the user's PATH (macOS).
+    ///
+    /// The CLI ships beside the GUI executable inside the notarized app bundle
+    /// (`TagTiger.app/Contents/MacOS/tagtiger-cli`). Because this code runs from
+    /// the already-notarized app, creating the symlink here avoids the
+    /// Gatekeeper quarantine block that a loose `.command` script hits. We
+    /// symlink `/usr/local/bin/tagtiger` -> that binary, escalating with an
+    /// authorization prompt only when `/usr/local/bin` isn't writable.
+    #[cfg(target_os = "macos")]
+    fn install_cli(&mut self) {
+        use std::path::PathBuf;
+
+        // The CLI lives next to the running GUI executable.
+        let cli = match std::env::current_exe() {
+            Ok(exe) => exe
+                .parent()
+                .map(|dir| dir.join("tagtiger-cli"))
+                .unwrap_or_else(|| PathBuf::from("tagtiger-cli")),
+            Err(e) => {
+                self.status = format!("Couldn't locate the app executable: {e}");
+                return;
+            }
+        };
+        if !cli.exists() {
+            self.status =
+                "Couldn't find the bundled CLI (tagtiger-cli) next to the app.".into();
+            return;
+        }
+
+        let dest = "/usr/local/bin/tagtiger";
+        let src = cli.to_string_lossy().to_string();
+
+        // Fast path: /usr/local/bin exists and is writable — link directly.
+        let bindir = std::path::Path::new("/usr/local/bin");
+        let writable_no_sudo = bindir.exists()
+            && std::fs::metadata(bindir)
+                .map(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    // Writable by the current user in practice: try a probe.
+                    m.permissions().mode() & 0o200 != 0
+                })
+                .unwrap_or(false)
+            // A permission-bit check isn't authoritative (ownership matters), so
+            // confirm with an actual write probe.
+            && std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(bindir.join(".tagtiger-write-probe"))
+                .map(|_| {
+                    let _ = std::fs::remove_file(bindir.join(".tagtiger-write-probe"));
+                    true
+                })
+                .unwrap_or(false);
+
+        if writable_no_sudo {
+            // Replace any existing link/file, then create the symlink.
+            let _ = std::fs::remove_file(dest);
+            match std::os::unix::fs::symlink(&src, dest) {
+                Ok(()) => {
+                    self.status = format!("Installed CLI: run `tagtiger --help`. ({dest})");
+                }
+                Err(e) => self.status = format!("Failed to install CLI: {e}"),
+            }
+            return;
+        }
+
+        // Privileged path: prompt for admin rights via osascript. The shell
+        // command creates /usr/local/bin if needed and (re)creates the symlink.
+        // Paths are single-quoted for the shell; embedded single quotes in the
+        // source path are escaped defensively.
+        let esc = |s: &str| s.replace('\'', r"'\''");
+        let shell_cmd = format!(
+            "mkdir -p /usr/local/bin && ln -sf '{}' '{}'",
+            esc(&src),
+            esc(dest)
+        );
+        // osascript "do shell script ... with administrator privileges" wants a
+        // string literal; escape backslashes and double quotes for AppleScript.
+        let as_literal = shell_cmd.replace('\\', r"\\").replace('"', r#"\""#);
+        let script = format!(
+            "do shell script \"{as_literal}\" with administrator privileges"
+        );
+
+        match std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                self.status = format!("Installed CLI: run `tagtiger --help`. ({dest})");
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                // User cancelling the auth prompt shows up as "User canceled."
+                if err.contains("User canceled") || err.contains("(-128)") {
+                    self.status = "CLI install cancelled.".into();
+                } else {
+                    self.status = format!("Failed to install CLI: {}", err.trim());
+                }
+            }
+            Err(e) => self.status = format!("Failed to run installer: {e}"),
+        }
+    }
 }
 
 /// egui version string, for the About "Built with" line.
 const EGUI_VERSION: &str = "0.36";
 const GLOWING_CAT_URL: &str = "https://glowingcat.com/TagTiger.html";
 const ISSUES_URL: &str = "https://github.com/richlesh/TagTiger/issues";
+/// Where users generate a TMDB v4 read access token.
+const TMDB_API_SETTINGS_URL: &str = "https://www.themoviedb.org/settings/api";
 
 /// A dark dialog background matching TagTiger's `#1e1e1e` panels.
 fn dialog_frame() -> egui::Frame {

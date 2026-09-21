@@ -133,10 +133,15 @@ Linux releases include `.deb` and `.rpm` packages in addition to a `.tar.gz`.
 A single Linux binary per architecture runs on both Debian- and Red Hat-family
 distributions; the `-gnu` builds are produced on an older Ubuntu image to keep
 the glibc requirement low. macOS ships a notarized `.dmg` containing the
-`TagTiger.app` (with the `tagtiger` CLI inside it) and an
-"Install tagtiger CLI.command" that symlinks the CLI to `/usr/local/bin`;
-Windows ships a `.zip`. Loose macOS binaries are intentionally not published —
-Gatekeeper quarantines them, so everything ships inside the notarized `.dmg`.
+`TagTiger.app` (with the `tagtiger` CLI inside it at
+`Contents/MacOS/tagtiger-cli`). To put the CLI on your PATH, launch the app and
+choose **Help ▸ Install Command-Line Tool…**, which symlinks
+`/usr/local/bin/tagtiger` to the notarized binary inside the app (prompting for
+admin rights only if `/usr/local/bin` isn't writable). A loose installer script
+is intentionally not shipped — a standalone `.command` can't be notarized, so
+Gatekeeper hard-blocks it on download. Windows ships a `.zip`. Loose macOS
+binaries are intentionally not published — Gatekeeper quarantines them, so
+everything ships inside the notarized `.dmg`.
 
 Releases are cut from the **Release** workflow: run it manually with a version
 (the tag is created and pushed for you) or push a `vX.Y.Z` tag directly.

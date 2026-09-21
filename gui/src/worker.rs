@@ -52,6 +52,10 @@ pub enum Request {
         /// is placed after mdat.
         fast_start: bool,
     },
+    /// Replace the TMDB credential at runtime with a v4 Bearer token entered in
+    /// the Settings dialog. An empty string clears it and falls back to the
+    /// `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables.
+    SetBearerToken(String),
 }
 
 /// Events the worker sends back to the UI.
@@ -117,8 +121,12 @@ pub struct Worker {
 
 impl Worker {
     /// Spawn the worker thread. `repaint` is called after each event so egui
-    /// wakes up to process it.
-    pub fn spawn(repaint: impl Fn() + Send + Sync + 'static) -> Self {
+    /// wakes up to process it. `initial_token` is the saved TMDB Bearer token
+    /// from settings (empty to fall back to the environment).
+    pub fn spawn(
+        initial_token: String,
+        repaint: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Event>();
         let repaint = Arc::new(repaint);
@@ -129,9 +137,16 @@ impl Worker {
                 .build()
                 .expect("tokio runtime");
             let client = reqwest::Client::new();
-            let provider: Option<Arc<TmdbProvider>> = TmdbProvider::from_env().ok().map(Arc::new);
+            let mut provider: Option<Arc<TmdbProvider>> = build_provider(&initial_token);
 
             while let Ok(req) = req_rx.recv() {
+                // Credential updates are handled inline so they mutate the
+                // loop-owned provider; everything else is dispatched to handle().
+                if let Request::SetBearerToken(token) = req {
+                    provider = build_provider(&token);
+                    repaint();
+                    continue;
+                }
                 let evt_tx = evt_tx.clone();
                 let client = client.clone();
                 let provider = provider.clone();
@@ -156,6 +171,17 @@ impl Worker {
             tx: req_tx,
             rx: evt_rx,
         }
+    }
+}
+
+/// Build a TMDB provider from a saved Bearer token, falling back to the
+/// environment (`TMDB_BEARER_TOKEN` / `TMDB_API_KEY`) when the token is empty.
+fn build_provider(token: &str) -> Option<Arc<TmdbProvider>> {
+    let token = token.trim();
+    if !token.is_empty() {
+        Some(Arc::new(TmdbProvider::with_bearer(token)))
+    } else {
+        TmdbProvider::from_env().ok().map(Arc::new)
     }
 }
 
@@ -280,6 +306,9 @@ async fn handle(
             )?;
             Ok(Some(Event::WriteDone { file }))
         }
+        // Handled inline in the worker loop (mutates the provider); never
+        // dispatched here.
+        Request::SetBearerToken(_) => Ok(None),
     }
 }
 
