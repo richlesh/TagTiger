@@ -136,6 +136,9 @@ struct Controller {
     /// Deferred donation splash: set on an unlicensed every-5th write, shown
     /// once the "Update complete" dialog is dismissed.
     splash_pending: bool,
+    /// Theme (dark?) when the Settings dialog was opened, so Cancel can revert a
+    /// live theme preview.
+    theme_before_settings: bool,
 }
 
 /// Build the window, wire up the worker + callbacks, and run the event loop.
@@ -195,6 +198,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         full_images: Vec::new(),
         full_requested: Vec::new(),
         splash_pending: false,
+        theme_before_settings: true,
     }));
 
     // App version + icon for the dialogs.
@@ -206,6 +210,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // License state drives the About "thank you" and the startup splash.
     let licensed = ctrl.borrow().settings.is_licensed();
     window.set_about_licensed(licensed);
+
+    // Theme: apply the persisted Light/Dark setting to the window.
+    let dark = ctrl.borrow().settings.theme_is_dark();
+    window.set_theme_dark(dark);
+    window.set_settings_theme_index(if dark { 1 } else { 0 });
 
     wire_callbacks(&window, &ctrl);
 
@@ -365,9 +374,14 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         }
     });
     window.on_settings_cancel({
+        let ctrl = ctrl.clone();
         let handle = window.as_weak();
         move || {
             if let Some(w) = handle.upgrade() {
+                // Revert any live theme preview to what it was on open.
+                let prev = ctrl.borrow().theme_before_settings;
+                w.set_theme_dark(prev);
+                w.set_settings_theme_index(if prev { 1 } else { 0 });
                 w.set_show_settings(false);
             }
         }
@@ -378,6 +392,15 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         move || {
             if let Some(w) = handle.upgrade() {
                 settings_save(&ctrl, &w);
+            }
+        }
+    });
+    window.on_theme_changed({
+        let handle = window.as_weak();
+        move |idx| {
+            if let Some(w) = handle.upgrade() {
+                // 0 = Light, 1 = Dark. Apply immediately for a live preview.
+                w.set_theme_dark(idx != 0);
             }
         }
     });
@@ -1328,19 +1351,30 @@ fn license_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     }
 }
 
-/// Open the Settings dialog, prefilling the saved TMDB Bearer token.
+/// Open the Settings dialog, prefilling the saved TMDB Bearer token + theme.
 fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
-    let token = ctrl.borrow().settings.tmdb_bearer_token.clone();
+    let (token, dark) = {
+        let c = ctrl.borrow();
+        (c.settings.tmdb_bearer_token.clone(), c.settings.theme_is_dark())
+    };
     w.set_settings_token(SharedString::from(token));
+    // Reflect the current theme in the selector; remember it so Cancel can
+    // revert a live preview.
+    w.set_settings_theme_index(if dark { 1 } else { 0 });
+    w.set_theme_dark(dark);
+    ctrl.borrow_mut().theme_before_settings = dark;
     w.set_show_settings(true);
 }
 
-/// Save the TMDB token from the Settings dialog and hand it to the worker.
+/// Save the TMDB token + theme from the Settings dialog and hand the token to
+/// the worker.
 fn settings_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let token = w.get_settings_token().trim().to_string();
+    let dark = w.get_settings_theme_index() != 0;
     let result = {
         let mut c = ctrl.borrow_mut();
         c.settings.tmdb_bearer_token = token.clone();
+        c.settings.theme = if dark { "Dark".into() } else { "Light".into() };
         c.settings.save()
     };
     match result {

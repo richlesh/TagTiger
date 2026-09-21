@@ -20,7 +20,31 @@ import {
     GroupBox,
     StandardButton,
     ProgressIndicator,
+    Palette,
 } from "std-widgets.slint";
+
+// App-wide theme colors, derived from the built-in Palette (whose color-scheme
+// the controller sets to match the Light/Dark setting). Custom surfaces (window
+// background, dialog cards, scrim, muted text, links) read from here so the
+// whole UI — not just the built-in widgets — follows the selected theme.
+export global Theme {
+    // True when the active color scheme is dark. Bound from MainWindow so the
+    // built-in Palette and our own colors stay in lockstep.
+    in property <bool> dark: true;
+
+    out property <brush> window-bg: Palette.background;
+    out property <brush> text: Palette.foreground;
+    out property <brush> muted-text: dark ? #9a9a9a : #666666;
+    out property <brush> card-bg: dark ? #262626 : #f4f4f4;
+    out property <brush> border: dark ? #4a4a4a : #cccccc;
+    out property <brush> scrim: dark ? #000000c0 : #00000060;
+    out property <brush> link: dark ? #5c9dff : #0a58ca;
+    out property <brush> link-hover: dark ? #7fb0ff : #3b7dd8;
+    out property <brush> hairline: dark ? #666666 : #cccccc;
+    out property <brush> hover-row: dark ? #ffffff14 : #00000010;
+    out property <brush> error-text: dark ? #e0a0a0 : #b00020;
+    out property <brush> placeholder-text: dark ? #999999 : #888888;
+}
 
 // One TMDB search result shown in the Matches list.
 export struct MatchItem {
@@ -104,7 +128,7 @@ component Hyperlink inherits TouchArea {
     mouse-cursor: pointer;
     Text {
         text: root.text;
-        color: touch-hover ? #7fb0ff : #5c9dff;
+        color: touch-hover ? Theme.link-hover : Theme.link;
         horizontal-alignment: center;
     }
     property <bool> touch-hover: root.has-hover;
@@ -115,7 +139,7 @@ component Hyperlink inherits TouchArea {
 // scrim (outside the card) is clicked.
 component DialogScrim inherits Rectangle {
     callback dismiss();
-    background: #000000c0;
+    background: Theme.scrim;
     // Catch clicks on the scrim so they don't fall through to the editor.
     TouchArea {
         clicked => { root.dismiss(); }
@@ -130,6 +154,20 @@ export component MainWindow inherits Window {
     min-width: 760px;
     min-height: 560px;
     icon: root.window-icon;
+    background: Theme.window-bg;
+
+    // Theme: the controller sets `theme-dark` from the persisted Light/Dark
+    // setting; we propagate it to the `Theme` global (our custom colors) and
+    // the built-in widget `Palette` on init and whenever it changes.
+    in property <bool> theme-dark: true;
+    init => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed theme-dark => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
 
     // ---- Window / app state (set by the controller) --------------------
     in property <image> window-icon;
@@ -210,6 +248,8 @@ export component MainWindow inherits Window {
     in property <string> license-msg;
     in property <bool> show-settings: false;
     in-out property <string> settings-token;
+    // Theme selector: 0 = Light, 1 = Dark (matches the Settings ComboBox model).
+    in-out property <int> settings-theme-index: 1;
     in property <bool> show-no-credential: false;
     in property <bool> show-lightbox: false;
     in property <image> lightbox-image;
@@ -254,6 +294,7 @@ export component MainWindow inherits Window {
     callback license-key-edited();       // reformat key as the user types
     callback settings-cancel();
     callback settings-save();
+    callback theme-changed(int);         // 0 = Light, 1 = Dark (live apply)
     callback no-cred-ok();
     callback no-cred-open-settings();
     callback lightbox-close();
@@ -356,7 +397,7 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        Rectangle { height: 1px; background: #888; }
+                        Rectangle { height: 1px; background: Theme.hairline; }
 
                         // Fields + poster columns.
                         HorizontalBox {
@@ -520,7 +561,7 @@ export component MainWindow inherits Window {
                                     width: 150px;
                                     height: 210px;
                                     border-width: root.poster-selected ? 3px : 1px;
-                                    border-color: root.poster-selected ? #6ca0ff : #888;
+                                    border-color: root.poster-selected ? Palette.accent-background : Theme.border;
                                     border-radius: 4px;
                                     clip: true;
 
@@ -554,7 +595,7 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        Rectangle { height: 1px; background: #888; }
+                        Rectangle { height: 1px; background: Theme.hairline; }
 
                         Button {
                             text: "Write tags";
@@ -562,10 +603,10 @@ export component MainWindow inherits Window {
                             clicked => { root.write-tags(); }
                         }
 
-                        Rectangle { height: 1px; background: #888; }
+                        Rectangle { height: 1px; background: Theme.hairline; }
 
                         Text { text: "Poster choices (TMDB)"; font-size: 16px; font-weight: 700; }
-                        Text { text: "Click to set as current poster · double-click to enlarge"; color: #999; }
+                        Text { text: "Click to set as current poster · double-click to enlarge"; color: Theme.muted-text; }
 
                         // Poster grid: a wrapping grid of fixed-size tiles laid
                         // out in a fixed number of columns. Tiles are absolutely
@@ -589,7 +630,7 @@ export component MainWindow inherits Window {
                                 width: parent.tile-w;
                                 height: parent.tile-h;
                                 border-width: 1px;
-                                border-color: #888;
+                                border-color: Theme.border;
                                 border-radius: 4px;
                                 clip: true;
                                 if poster.loaded: Image {
@@ -621,15 +662,15 @@ export component MainWindow inherits Window {
                 Text { text: "Matches"; font-size: 16px; font-weight: 700; }
                 if root.matches.length == 0: Text {
                     text: "No matches yet. Type a title and press search.";
-                    color: #999;
+                    color: Theme.muted-text;
                     wrap: word-wrap;
                 }
-                if root.loading-details: Text { text: "Loading details…"; color: #999; }
+                if root.loading-details: Text { text: "Loading details…"; color: Theme.muted-text; }
                 ListView {
                     vertical-stretch: 1;
                     for m[i] in root.matches: Rectangle {
                         height: 34px;
-                        background: touch.has-hover ? #ffffff10 : transparent;
+                        background: touch.has-hover ? Theme.hover-row : transparent;
                         touch := TouchArea {
                             enabled: !root.loading-details;
                             clicked => { root.select-match(i); }
@@ -659,19 +700,19 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 320px;
             height: about-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             about-col := VerticalBox {
                 alignment: start;
                 spacing: 6px;
                 padding: 16px;
                 Image { source: root.app-icon; width: 96px; height: 96px; }
                 Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: "Version " + root.app-version; color: #aaa; horizontal-alignment: center; }
-                Text { text: "©2026 Richard Lesh"; color: #aaa; horizontal-alignment: center; }
-                Text { text: "Built with Slint"; color: #aaa; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "©2026 Richard Lesh"; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "Built with Slint"; color: Theme.muted-text; horizontal-alignment: center; }
                 Hyperlink {
                     text: "Glowing Cat Software";
                     url: "https://glowingcat.com/TagTiger.html";
@@ -684,7 +725,7 @@ export component MainWindow inherits Window {
                 }
                 if root.about-licensed: Text {
                     text: "Thank you for donating to\nGlowing Cat Software!";
-                    color: #e0e0e0;
+                    color: Theme.text;
                     font-weight: 700;
                     horizontal-alignment: center;
                 }
@@ -699,20 +740,20 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 340px;
             height: splash-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             splash-col := VerticalBox {
                 alignment: start;
                 spacing: 6px;
                 padding: 16px;
                 Image { source: root.app-icon; width: 96px; height: 96px; }
                 Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: "Version " + root.app-version; color: #aaa; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
                 Text {
                     text: "If you enjoy using this product please consider donating to help fund this and other open source projects.";
-                    color: #ddd;
+                    color: Theme.text;
                     wrap: word-wrap;
                     horizontal-alignment: center;
                 }
@@ -732,16 +773,16 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 360px;
             height: lic-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             lic-col := VerticalBox {
                 alignment: start;
                 spacing: 8px;
                 padding: 16px;
                 Text { text: "License Key"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: "Enter your email address and license key"; color: #aaa; horizontal-alignment: center; wrap: word-wrap; }
+                Text { text: "Enter your email address and license key"; color: Theme.muted-text; horizontal-alignment: center; wrap: word-wrap; }
                 LineEdit {
                     placeholder-text: "Your email address";
                     text <=> root.license-email;
@@ -758,7 +799,7 @@ export component MainWindow inherits Window {
                     url: "https://glowingcat.com/TagTiger.html";
                     open-url(u) => { root.open-url(u); }
                 }
-                if root.license-msg != "": Text { text: root.license-msg; color: #e0a0a0; wrap: word-wrap; }
+                if root.license-msg != "": Text { text: root.license-msg; color: Theme.error-text; wrap: word-wrap; }
                 HorizontalBox {
                     alignment: end;
                     Button { text: "Cancel"; clicked => { root.license-cancel(); } }
@@ -774,16 +815,16 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 400px;
             height: set-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             set-col := VerticalBox {
                 alignment: start;
                 spacing: 8px;
                 padding: 16px;
                 Text { text: "Settings"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: "TMDB Bearer Token"; color: #ddd; }
+                Text { text: "TMDB Bearer Token"; color: Theme.text; }
                 LineEdit {
                     placeholder-text: "Paste your v4 read access token";
                     input-type: password;
@@ -794,6 +835,18 @@ export component MainWindow inherits Window {
                     text: "To get a TMDB API Read Access Token…";
                     url: "https://www.themoviedb.org/settings/api";
                     open-url(u) => { root.open-url(u); }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "Theme"; color: Theme.text; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: ["Light", "Dark"];
+                        current-index <=> root.settings-theme-index;
+                        // Apply live so the user sees the change immediately.
+                        selected(v) => { root.theme-changed(self.current-index); }
+                    }
                 }
                 HorizontalBox {
                     alignment: end;
@@ -810,10 +863,10 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 400px;
             height: nc-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             nc-col := VerticalBox {
                 alignment: start;
                 spacing: 8px;
@@ -821,7 +874,7 @@ export component MainWindow inherits Window {
                 Text { text: "TMDB credential required"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
                 Text {
                     text: "A TMDB account and API Read Access Token are required for TMDB searches. Configure your token in the Settings dialog.";
-                    color: #ddd;
+                    color: Theme.text;
                     wrap: word-wrap;
                 }
                 Hyperlink {
@@ -844,20 +897,20 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 380px;
             height: prog-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             prog-col := VerticalBox {
                 alignment: start;
                 spacing: 10px;
                 padding: 16px;
-                Text { text: "Rewriting file (moving media)…"; color: #ddd; horizontal-alignment: center; }
+                Text { text: "Rewriting file (moving media)…"; color: Theme.text; horizontal-alignment: center; }
                 ProgressIndicator {
                     width: 100%;
                     progress: root.progress-fraction;
                 }
-                if root.progress-caption != "": Text { text: root.progress-caption; color: #aaa; horizontal-alignment: center; }
+                if root.progress-caption != "": Text { text: root.progress-caption; color: Theme.muted-text; horizontal-alignment: center; }
             }
         }
     }
@@ -868,16 +921,16 @@ export component MainWindow inherits Window {
         Rectangle {
             width: 360px;
             height: comp-col.preferred-height + 32px;
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             comp-col := VerticalBox {
                 alignment: start;
                 spacing: 12px;
                 padding: 16px;
                 Text { text: "Update complete"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: root.complete-msg; color: #ddd; wrap: word-wrap; horizontal-alignment: center; }
+                Text { text: root.complete-msg; color: Theme.text; wrap: word-wrap; horizontal-alignment: center; }
                 Button { text: "OK"; clicked => { root.complete-ok(); } }
             }
         }
@@ -889,10 +942,10 @@ export component MainWindow inherits Window {
         Rectangle {
             width: min(root.width - 80px, 800px);
             height: min(root.height - 80px, 800px);
-            background: #1e1e1e;
+            background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #444;
+            border-color: Theme.border;
             VerticalBox {
                 padding: 12px;
                 if root.lightbox-loaded: Image {
@@ -901,7 +954,7 @@ export component MainWindow inherits Window {
                 }
                 if !root.lightbox-loaded: Text {
                     text: "Loading…";
-                    color: #ddd;
+                    color: Theme.text;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
