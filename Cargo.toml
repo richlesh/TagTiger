@@ -23,7 +23,12 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 
 # Async + HTTP
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query"] }
+# Use rustls WITHOUT the default aws-lc-rs provider (whose aws-lc-sys C build
+# complicates static-CRT linking on Windows, esp. aarch64). We install the
+# pure-Rust `ring` provider at startup instead — see rustls dep below.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "stream", "query"] }
+# Pull in rustls' `ring` crypto provider; installed process-wide at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 futures = "0.3"
 
 # MP4 iTunes-style tagging (pure Rust, compiled into the binary — not an external tool)

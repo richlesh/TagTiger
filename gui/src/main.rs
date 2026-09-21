@@ -3,6 +3,8 @@
 mod app;
 mod license;
 mod license_mgr;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod winassoc;
 mod worker;
 
@@ -22,11 +24,23 @@ fn load_window_icon() -> Option<eframe::egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Install the rustls `ring` crypto provider process-wide (reqwest is built
+    // with `rustls-no-provider`, so no provider is auto-installed). Must run
+    // before any TLS client is created by the worker. Ignore an error, which
+    // only means one is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // macOS: install the "Open Documents" Apple Event handler before the winit
+    // loop starts, so Finder "Open With" / dock drops / double-clicks (which
+    // winit does not forward) are captured — including the cold-launch event.
+    #[cfg(target_os = "macos")]
+    macos_open::install();
 
     // Windows file-association registration (per-user, no admin). Explicit
     // flags let a user (or a future installer) register/unregister; otherwise

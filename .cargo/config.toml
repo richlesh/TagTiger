@@ -1,0 +1,14 @@
+# Statically link the Microsoft Visual C++ runtime into the Windows binaries.
+#
+# By default, MSVC builds dynamically link the VC++ runtime (VCRUNTIME140.dll,
+# MSVCP140.dll, ...), which is absent on machines without the "Visual C++
+# Redistributable" installed — common on Windows ARM64 — causing a
+# "VCRUNTIME140.dll is missing" error at launch. `+crt-static` bakes the runtime
+# into the .exe so the app runs standalone from the shipped .zip, with no
+# redistributable required.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

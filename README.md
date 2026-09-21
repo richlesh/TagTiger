@@ -139,7 +139,11 @@ choose **Help ▸ Install Command-Line Tool…**, which symlinks
 `/usr/local/bin/tagtiger` to the notarized binary inside the app (prompting for
 admin rights only if `/usr/local/bin` isn't writable). A loose installer script
 is intentionally not shipped — a standalone `.command` can't be notarized, so
-Gatekeeper hard-blocks it on download. Windows ships a `.zip`. Loose macOS
+Gatekeeper hard-blocks it on download. Windows ships a signed Inno Setup
+installer (`TagTiger-<arch>-Setup.exe`) that lets you install the GUI, the
+`tagtiger` CLI, or both — creating Start Menu/desktop shortcuts, registering
+`.mp4`/`.m4v` in "Open with", and optionally adding the CLI to your PATH — plus
+a portable `.zip` for those who prefer loose binaries. Loose macOS
 binaries are intentionally not published — Gatekeeper quarantines them, so
 everything ships inside the notarized `.dmg`.
 

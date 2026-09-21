@@ -249,6 +249,49 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      # Build a proper Windows installer (Inno Setup) from the signed binaries.
+      # Lets the user pick the GUI, the CLI, or both; installs to Program Files;
+      # creates shortcuts; registers .mp4/.m4v "Open with"; and (optionally) adds
+      # the CLI to PATH. Produces TagTiger-<arch>-Setup.exe.
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $arch = if ("${{ matrix.target }}" -like "aarch64*") { "arm64" } else { "x64" }
+          # Version for the installer's display: prefer the dispatch input or the
+          # pushed tag, else fall back to the workspace Cargo.toml version.
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) { $version = "${{ github.ref_name }}" }
+          $version = $version -replace '^v',''
+          if (-not $version -or $version -notmatch '^\d+\.\d+\.\d+') {
+            $m = Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            $version = if ($m) { $m.Matches[0].Groups[1].Value } else { "0.0.0" }
+          }
+          $src = "$PWD/target/${{ matrix.target }}/release"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$version" `
+            "/DArch=$arch" `
+            "/DSourceDir=$src" `
+            "packaging/windows/tagtiger.iss"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "packaging/windows/TagTiger-$arch-Setup.exe" "dist/"
+
+      # Sign the installer itself (the inner binaries were already signed above).
+      - name: Sign installer (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: dist
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Archive (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -269,6 +312,7 @@ jobs:
             dist/*.dmg
             dist/*.tar.gz
             dist/*.zip
+            dist/*.exe
             dist/*.deb
             dist/*.rpm
           if-no-files-found: ignore

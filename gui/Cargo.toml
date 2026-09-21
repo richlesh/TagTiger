@@ -17,6 +17,7 @@ tagtiger-core.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 eframe = "0.36"
@@ -30,6 +31,14 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# macOS: catch the "Open documents" Apple Event (Finder "Open With", dock-icon
+# drops, double-click) that winit does not forward. Versions match winit 0.30's
+# objc2 to avoid a second, incompatible objc2 in the graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSArray", "NSURL", "NSData"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+
 # Windows: embed the .ico into the executable at build time.
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
@@ -41,6 +50,7 @@ priority = "optional"
 depends = "libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1"
 assets = [
     ["target/release/tagtiger-gui", "usr/bin/", "755"],
+    ["target/release/tagtiger", "usr/bin/", "755"],
     ["../packaging/tagtiger.desktop", "usr/share/applications/", "644"],
     ["src/resources/app_icon_256.png", "usr/share/icons/hicolor/256x256/apps/tagtiger.png", "644"],
 ]
@@ -48,6 +58,7 @@ assets = [
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/tagtiger-gui", dest = "/usr/bin/tagtiger-gui", mode = "755" },
+    { source = "target/release/tagtiger", dest = "/usr/bin/tagtiger", mode = "755" },
     { source = "../packaging/tagtiger.desktop", dest = "/usr/share/applications/tagtiger.desktop", mode = "644" },
     { source = "src/resources/app_icon_256.png", dest = "/usr/share/icons/hicolor/256x256/apps/tagtiger.png", mode = "644" },
 ]

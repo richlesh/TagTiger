@@ -17,6 +17,7 @@ tagtiger-core.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }

@@ -51,6 +51,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the rustls `ring` crypto provider process-wide (reqwest is built
+    // with `rustls-no-provider`, so no provider is auto-installed). Ignore an
+    // error, which only means one is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

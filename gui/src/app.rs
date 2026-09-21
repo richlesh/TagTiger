@@ -952,6 +952,17 @@ impl eframe::App for App {
             ctx.set_cursor_icon(egui::CursorIcon::Wait);
         }
 
+        // macOS: pick up any files delivered via the "Open Documents" Apple
+        // Event (Finder "Open With", dock drops, double-click) that winit does
+        // not surface as dropped_files.
+        #[cfg(target_os = "macos")]
+        for path in crate::macos_open::take_pending() {
+            if is_movie_path(&path) && path.exists() {
+                let _ = self.worker.tx.send(Request::OpenFile { path });
+                self.status = "Opening file…".into();
+            }
+        }
+
         // Handle a pasted image (Cmd/Ctrl+V) or a dropped image file: either
         // replaces the current poster.
         self.handle_image_input(&ctx);
@@ -2490,6 +2501,23 @@ fn read_clipboard_text() -> Option<String> {
 fn write_clipboard_image(bytes: &[u8]) -> Result<(), ()> {
     let img = image::load_from_memory(bytes).map_err(|_| ())?.to_rgba8();
     let (w, h) = (img.width() as usize, img.height() as usize);
+
+    // On macOS, also write a standard PNG pasteboard type. arboard writes only
+    // TIFF, which some apps (and the OS "no image" cases) don't surface; the
+    // PNG type is recognized everywhere. Re-encode the RGBA to PNG for this.
+    #[cfg(target_os = "macos")]
+    {
+        let mut png = std::io::Cursor::new(Vec::new());
+        if image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(&mut png, image::ImageFormat::Png)
+            .is_ok()
+            && crate::macos_open::write_pasteboard_png(png.get_ref())
+        {
+            return Ok(());
+        }
+        // Fall through to arboard if the native write failed.
+    }
+
     let data = arboard::ImageData {
         width: w,
         height: h,
