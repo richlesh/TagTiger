@@ -1,15 +1,14 @@
 //! macOS "Open Documents" handling for Finder "Open With", dock-icon drops, and
 //! double-clicking an associated file.
 //!
-//! winit (0.30) installs its own `NSApplicationDelegate` but implements neither
-//! `application:openURLs:` nor `application:openFile:`, and adding those methods
-//! to winit's delegate class after the fact is not picked up by AppKit. So we
-//! register our own handler object on the shared `NSAppleEventManager` for the
+//! The windowing backend installs its own `NSApplicationDelegate` but does not
+//! implement `application:openURLs:` / `application:openFile:`, so we register
+//! our own handler object on the shared `NSAppleEventManager` for the
 //! `kCoreEventClass`/`kAEOpenDocuments` (`aevt`/`odoc`) Apple Event. This is
 //! last-writer-wins and independent of AppKit's delegate, but must be installed
-//! *after* `NSApplication` exists (i.e. once the winit event loop is running) so
-//! it overrides AppKit's default routing. Resolved paths are queued and drained
-//! by the egui update loop each frame.
+//! *after* `NSApplication` exists (i.e. once the event loop is running) so it
+//! overrides AppKit's default routing. Resolved paths are queued here and
+//! drained by the Slint controller's event-loop timer (see app.rs).
 
 #![cfg(target_os = "macos")]
 
@@ -17,12 +16,16 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, Sel};
+use objc2::runtime::{AnyObject, Bool, NSObject, Sel};
 use objc2::{msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager};
 
-/// Paths delivered by open events, awaiting the UI to pick them up.
+/// Paths delivered by open events (Apple Event *or* a movie dropped on the
+/// window), awaiting the UI to pick them up and open them.
 static PENDING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Image files dropped on the window, awaiting the UI to set one as the poster.
+static PENDING_IMAGES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Four-char-code helpers for the open-documents Apple Event.
 const fn fourcc(t: &[u8; 4]) -> u32 {
@@ -152,6 +155,189 @@ pub fn take_pending() -> Vec<PathBuf> {
         .lock()
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default()
+}
+
+/// Take any image files dropped on the window since the last call.
+pub fn take_pending_images() -> Vec<PathBuf> {
+    PENDING_IMAGES
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Native file drag-and-drop
+//
+// Slint 1.18 only supports in-app drag-and-drop; it does not receive external
+// OS file drops (pending upstream in winit). We add the capability on macOS by
+// installing a transparent overlay `NSView` over the window's content view that
+// is registered for file drags. Its `hitTest:` returns null so normal mouse
+// events pass straight through to the Slint view beneath; only drag events are
+// delivered to it. Dropped movie files go to `PENDING` (opened), image files to
+// `PENDING_IMAGES` (set as the poster) — the same queues the controller drains.
+// ---------------------------------------------------------------------------
+
+/// `NSDragOperationCopy`, the operation we advertise for file drops.
+const NS_DRAG_OPERATION_COPY: usize = 1;
+
+fn ext_is_movie(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("mp4") | Some("m4v")
+    )
+}
+fn ext_is_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") | Some("webp")
+    )
+}
+
+/// Read dropped file paths from a dragging-info's pasteboard and queue them.
+/// Returns true if at least one usable file was queued.
+unsafe fn handle_drop(sender: &AnyObject) -> bool {
+    use objc2_app_kit::NSFilenamesPboardType;
+    use objc2_foundation::{NSArray, NSString};
+
+    // let pb = [sender draggingPasteboard];
+    let pb: *mut AnyObject = msg_send![sender, draggingPasteboard];
+    if pb.is_null() {
+        return false;
+    }
+    // let list = [pb propertyListForType: NSFilenamesPboardType]; -> NSArray<NSString>
+    let list: *mut NSArray<NSString> =
+        msg_send![pb, propertyListForType: &**NSFilenamesPboardType];
+    if list.is_null() {
+        return false;
+    }
+    let list: &NSArray<NSString> = &*list;
+    let count = list.count();
+    let mut movies: Vec<PathBuf> = Vec::new();
+    let mut images: Vec<PathBuf> = Vec::new();
+    for i in 0..count {
+        let s: Retained<NSString> = list.objectAtIndex(i);
+        let path = PathBuf::from(s.to_string());
+        if ext_is_movie(&path) {
+            movies.push(path);
+        } else if ext_is_image(&path) {
+            images.push(path);
+        }
+    }
+    // Prefer opening a dropped movie; otherwise treat images as poster art.
+    if let Some(movie) = movies.into_iter().next() {
+        if let Ok(mut q) = PENDING.lock() {
+            q.push(movie);
+        }
+        return true;
+    }
+    if !images.is_empty() {
+        if let Ok(mut q) = PENDING_IMAGES.lock() {
+            q.extend(images);
+        }
+        return true;
+    }
+    false
+}
+
+// A transparent overlay view that accepts file drags. `hitTest:` returns null
+// so it never intercepts mouse events destined for the Slint view below.
+objc2::declare_class!(
+    struct DropView;
+
+    unsafe impl ClassType for DropView {
+        type Super = objc2_app_kit::NSView;
+        type Mutability = mutability::MainThreadOnly;
+        const NAME: &'static str = "TagTigerDropView";
+    }
+
+    impl DeclaredClass for DropView {}
+
+    unsafe impl DropView {
+        // Transparent to mouse events.
+        #[method(hitTest:)]
+        unsafe fn hit_test(&self, _point: objc2_foundation::NSPoint) -> *mut AnyObject {
+            std::ptr::null_mut()
+        }
+
+        // Advertise a copy operation while a drag hovers.
+        #[method(draggingEntered:)]
+        unsafe fn dragging_entered(&self, _sender: &AnyObject) -> usize {
+            NS_DRAG_OPERATION_COPY
+        }
+
+        #[method(draggingUpdated:)]
+        unsafe fn dragging_updated(&self, _sender: &AnyObject) -> usize {
+            NS_DRAG_OPERATION_COPY
+        }
+
+        // Accept the drop before it happens.
+        #[method(prepareForDragOperation:)]
+        unsafe fn prepare_for_drag_operation(&self, _sender: &AnyObject) -> Bool {
+            Bool::YES
+        }
+
+        // Read the dropped files and queue them.
+        #[method(performDragOperation:)]
+        unsafe fn perform_drag_operation(&self, sender: &AnyObject) -> Bool {
+            Bool::new(handle_drop(sender))
+        }
+    }
+);
+
+/// Install the native file-drop overlay on the window that owns `ns_view`
+/// (the Slint content view, obtained via its raw window handle). Adds a
+/// transparent, auto-resizing `DropView` as a sibling covering the content
+/// view and registers it for file drags. Safe to call once after the window
+/// exists; a no-op if the view/window can't be resolved.
+///
+/// # Safety
+/// `ns_view` must be a valid `NSView*` for the app's window, called on the
+/// main thread.
+pub unsafe fn install_drag_drop(ns_view: *mut std::ffi::c_void) {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSFilenamesPboardType, NSView};
+    use objc2_foundation::MainThreadMarker;
+
+    if ns_view.is_null() {
+        return;
+    }
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let view: &NSView = &*(ns_view as *const NSView);
+    // The content view is the drop target's superview; add the overlay there so
+    // it tracks the full window content and sits above the Slint view.
+    let content: *mut NSView = msg_send![view, superview];
+    let (parent, bounds_src): (&NSView, &NSView) = if content.is_null() {
+        (view, view)
+    } else {
+        (&*content, &*content)
+    };
+
+    let frame = bounds_src.bounds();
+    let overlay: Retained<DropView> = {
+        let alloc = mtm.alloc::<DropView>();
+        msg_send_id![alloc, initWithFrame: frame]
+    };
+
+    // Auto-resize with the parent (width + height sizable).
+    let _: () = msg_send![&overlay, setAutoresizingMask: 2usize | 16usize];
+
+    // Register for filename drags. Build the single-element type array via
+    // msg_send to sidestep NSArray::from_slice's element-type constraints on
+    // the NSPasteboardType (NSString) constant.
+    let filenames_type: &AnyObject = &**NSFilenamesPboardType as &AnyObject;
+    let types: *mut AnyObject = msg_send![
+        objc2::class!(NSArray),
+        arrayWithObject: filenames_type
+    ];
+    let _: () = msg_send![&overlay, registerForDraggedTypes: types];
+
+    // Add above existing subviews.
+    let _: () = msg_send![parent, addSubview: &*overlay];
+
+    // Keep the overlay alive for the process lifetime.
+    std::mem::forget(overlay);
 }
 
 /// Write PNG-encoded image bytes to the general pasteboard as a standard

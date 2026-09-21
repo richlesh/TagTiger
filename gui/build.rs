@@ -5,6 +5,10 @@
 //! no-op.
 
 fn main() {
+    // Compile the Slint UI (ui/app.slint) into Rust code included by main.rs.
+    println!("cargo:rerun-if-changed=ui/app.slint");
+    slint_build::compile("ui/app.slint").expect("compile ui/app.slint");
+
     // Re-run if the icon or resource script changes.
     println!("cargo:rerun-if-changed=app_icon.rc");
     println!("cargo:rerun-if-changed=src/resources/app_icon.ico");

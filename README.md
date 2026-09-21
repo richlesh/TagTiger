@@ -20,7 +20,7 @@ poster art), choose the video definition, and toggle a **fast-start**
 ```
 core/   library — domain model, MP4 atom tagging, providers, naming, artwork
 cli/    thin command-line frontend (binary: tagtiger)
-gui/    egui desktop app (binary: tagtiger-gui): metadata editor + poster grid
+gui/    Slint desktop app (binary: tagtiger-gui): metadata editor + poster grid
 ```
 
 The design keeps concerns decoupled:
@@ -44,12 +44,17 @@ cargo run -p tagtiger-gui          # launch the GUI
 
 ### Linux build dependencies (GUI)
 
-The egui GUI needs system X11/OpenGL client libraries at build and run time:
+The Slint GUI (default winit + femtovg/OpenGL backend) needs these system
+libraries at build and run time:
 
 ```sh
-sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
-  libxi-dev libgl1-mesa-dev libxkbcommon-dev
+sudo apt-get install -y build-essential libfontconfig-dev \
+  libx11-xcb1 libx11-dev libxcb1-dev libxkbcommon0 libxkbcommon-dev \
+  libgl1-mesa-dev
 ```
+
+On Wayland-only systems you may also want `libwayland-dev`; on X11, the `libxcb`
+packages above cover it.
 
 ## Usage (CLI)
 
@@ -86,14 +91,22 @@ doesn't supply a definition, deduces it from the video track's dimensions.
 cargo run -p tagtiger-gui          # or run the packaged binary
 ```
 
-The GUI is a full editor. Open an MP4/M4V (File ▸ Open…, drag-and-drop, or an
-"Open With" launch), search TMDB, and pick a poster from the grid. Every field
-is editable with a per-field **Lock** (locked fields aren't overwritten when you
-select a different match), and edits support **undo/redo**. Poster art can be
-selected, copied/cut, and replaced by pasting or dropping an image; a
-**Fast-start** checkbox controls whether the file is saved web-optimized
-(`moov` before `mdat`) or with `moov` last. The window/dock/taskbar icon and, on
-macOS/Windows, the executable and installer icons are bundled.
+The GUI is a full editor. Open an MP4/M4V (File ▸ Open…, an "Open With" launch,
+or — on macOS — by dropping a file onto the window or dock icon), search TMDB,
+and pick a poster from the grid. Every field is editable with a per-field
+**Lock** (locked fields aren't overwritten when you select a different match),
+and edits support **undo/redo**. Poster art can be selected, copied/cut, and
+replaced by pasting an image (Edit ▸ Paste) or, on macOS, by dropping an image
+file onto the window; a **Fast-start** checkbox controls whether the file is
+saved web-optimized (`moov` before `mdat`) or with `moov` last. The
+window/dock/taskbar icon and, on macOS/Windows, the executable and installer
+icons are bundled.
+
+> **Note on drag-and-drop:** dragging files from the file manager onto the
+> window is supported on **macOS** only. On Windows and Linux, receiving OS file
+> drops is not yet available in the Slint GUI toolkit (pending upstream support
+> in winit); use File ▸ Open…, the "Open file…" button, an "Open With" launch,
+> the command line, or Edit ▸ Paste for poster art.
 
 ### License
 

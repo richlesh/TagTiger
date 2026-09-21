@@ -1,5 +1,5 @@
 //! Background worker: runs a tokio runtime on its own thread and services
-//! requests from the (single-threaded) egui UI. The UI sends [`Request`]s and
+//! requests from the (single-threaded) UI. The UI sends [`Request`]s and
 //! receives [`Event`]s without ever blocking on network or disk.
 
 use std::path::PathBuf;
@@ -120,9 +120,9 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Spawn the worker thread. `repaint` is called after each event so egui
-    /// wakes up to process it. `initial_token` is the saved TMDB Bearer token
-    /// from settings (empty to fall back to the environment).
+    /// Spawn the worker thread. `repaint` is called after each event to wake
+    /// the UI event loop so it processes the event. `initial_token` is the
+    /// saved TMDB Bearer token from settings (empty to fall back to the env).
     pub fn spawn(initial_token: String, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Event>();
@@ -193,7 +193,7 @@ async fn handle(
         Request::PickFile => {
             // Async dialog runs off the UI thread, avoiding the nested-native-
             // run-loop panic that occurs when a blocking rfd dialog is called
-            // from inside an eframe/winit frame on macOS.
+            // from inside the UI's event loop on macOS.
             let picked = rfd::AsyncFileDialog::new()
                 .add_filter("MP4/M4V", &["mp4", "m4v"])
                 .pick_file()

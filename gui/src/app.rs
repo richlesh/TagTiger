@@ -1,20 +1,33 @@
-//! egui application: the poster-selection and field-editing UI.
+//! Slint desktop app for TagTiger — window bootstrap + controller.
+//!
+//! The `.slint` UI (see ui/app.slint) owns the widgets and holds the editable
+//! field values / locks as two-way-bound properties. This module hosts the
+//! controller: it bridges those properties and the UI callbacks to the
+//! background [`Worker`] channel, and ports the editor logic from the former
+//! egui frontend — worker-event handling, undo/redo, load/collect metadata,
+//! poster clipboard/drag-drop, search, and write.
+//!
+//! Dialogs (About, Splash, License, Settings, no-credential, lightbox, save
+//! progress/complete) are layered on in step 4; platform bits (window icon,
+//! macOS open-file drain, CLI install) in step 5.
 
-use crate::worker::{Event, Request, Worker};
-use eframe::egui;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
+
+use slint::{Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use tagtiger_core::model::{Definition, MediaMetadata, ProviderId, SearchResult, VideoKind};
 
-/// What the lightbox is currently showing.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lightbox {
-    /// A TMDB candidate poster by artwork index.
-    Tmdb(usize),
-    /// The poster currently embedded in / pasted into the file.
-    CurrentCover,
-}
+use crate::worker::{Event, Request, Worker};
+
+// The Slint-compiled UI (from ui/app.slint). Generates `MainWindow`,
+// `MatchItem`, `PosterItem`.
+slint::include_modules!();
 
 /// A restorable snapshot of the user-editable state, used for undo/redo.
+/// Field text lives in Slint properties; a snapshot copies it out so it can be
+/// restored later.
 #[derive(Clone, PartialEq)]
 struct Snapshot {
     title: String,
@@ -30,770 +43,1684 @@ struct Snapshot {
     producers: String,
     writers: String,
     studio: String,
-    /// Encoded bytes of the current cover, if any.
     cover_bytes: Option<Vec<u8>>,
     cover_size: Option<(u32, u32)>,
 }
 
-pub struct App {
+/// An empty snapshot for initializing the committed baseline before any file
+/// is loaded.
+fn empty_snapshot() -> Snapshot {
+    Snapshot {
+        title: String::new(),
+        year: String::new(),
+        video_kind: None,
+        definition: None,
+        rating: String::new(),
+        summary: String::new(),
+        overview: String::new(),
+        genres: String::new(),
+        cast: String::new(),
+        directors: String::new(),
+        producers: String::new(),
+        writers: String::new(),
+        studio: String::new(),
+        cover_bytes: None,
+        cover_size: None,
+    }
+}
+
+/// What the lightbox is currently showing (used in step 4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum Lightbox {
+    Tmdb(usize),
+    CurrentCover,
+}
+
+/// Controller state shared between the UI callbacks and the event-drain timer.
+/// Mirrors the former egui `App` fields, minus the egui textures (Slint images
+/// are pushed straight into properties/models instead).
+struct Controller {
     worker: Worker,
 
     file: Option<PathBuf>,
-    status: String,
-    /// True once a file has been opened (so the editing panel is shown even
-    /// before any TMDB search).
     file_loaded: bool,
-    /// True while a match's details are being fetched; locks match selection
-    /// and shows a busy cursor.
     loading_details: bool,
 
-    /// Search box contents (prefilled with the file's title or filename stem).
-    search_query: String,
-
-    results: Vec<SearchResult>,
-    /// Working metadata: prefilled from the file, updated when a match's
-    /// details are fetched.
+    /// Working metadata: prefilled from the file, updated when a match loads.
     meta: Option<MediaMetadata>,
+    /// TMDB search results backing the Matches list.
+    results: Vec<SearchResult>,
 
-    /// Thumbnail of the poster currently embedded in (or pasted into) the file.
-    cover_thumb: Option<egui::TextureHandle>,
-    /// Full-resolution texture of the current cover, for the lightbox.
-    cover_full: Option<egui::TextureHandle>,
-    /// Original pixel dimensions of the current cover, for the size caption.
-    cover_size: Option<(u32, u32)>,
     /// Encoded bytes (PNG/JPEG) of the current cover — the single source of
-    /// truth for the poster; textures are derived from it. Written to the file
-    /// when tagging.
+    /// truth for the poster. Written to the file when tagging.
     cover_bytes: Option<Vec<u8>>,
-    /// Whether the current poster is selected (shows a highlight border and
-    /// enables Cut/Copy).
-    poster_selected: bool,
+    cover_size: Option<(u32, u32)>,
 
-    /// Loaded poster thumbnails keyed by artwork index.
-    thumbs: Vec<Option<egui::TextureHandle>>,
-    /// Whether a thumbnail fetch has already been requested (lazy loading).
-    thumb_requested: Vec<bool>,
-    selected_artwork: Option<usize>,
-
-    /// What the lightbox is currently showing, if open.
-    lightbox: Option<Lightbox>,
-    /// Full-resolution textures for TMDB posters, keyed by artwork index.
-    full_images: Vec<Option<egui::TextureHandle>>,
-
-    // Editable string buffers bound to the fields.
-    edit_title: String,
-    edit_year: String,
-    edit_rating: String,
-    edit_summary: String,
-    edit_overview: String,
-    edit_genres: String,
-    edit_cast: String,
-    edit_directors: String,
-    edit_producers: String,
-    edit_writers: String,
-    edit_studio: String,
-
-    // Per-field locks: when set, the field is read-only and is not overwritten
-    // when a new match's details load.
-    lock_title: bool,
-    lock_year: bool,
-    lock_rating: bool,
-    lock_summary: bool,
-    lock_overview: bool,
-    lock_genres: bool,
-    lock_cast: bool,
-    lock_directors: bool,
-    lock_producers: bool,
-    lock_writers: bool,
-    lock_studio: bool,
-    /// Lock for the poster/cover: when set, selecting a match won't change the
-    /// chosen poster and a pasted/dropped image is ignored.
-    lock_poster: bool,
-
-    // Undo/redo history of snapshots.
+    /// Undo/redo history of snapshots.
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
-    /// A pending "before" snapshot captured when a text edit begins, pushed to
-    /// the undo stack once the edit is committed (focus lost / value settled).
-    /// This coalesces a run of keystrokes into a single undo step.
+    /// A pending "before" snapshot captured when a text edit begins, committed
+    /// once the edit settles (coalesces a run of keystrokes into one step).
     text_edit_pending: Option<Snapshot>,
-    /// The text widget that held focus as of the start of this frame. Captured
-    /// before menus are drawn, because opening a menu clears live focus.
-    last_text_focus: Option<egui::Id>,
+    /// The last stable editable state. Because Slint two-way bindings update a
+    /// property *before* its change callback runs, we can't read the "before"
+    /// value from the widget; this baseline holds it so dropdown/discrete
+    /// changes remain undoable. Refreshed after every committed change.
+    committed: Snapshot,
 
-    /// Selected media/video kind (`stik`) and its lock.
-    edit_video_kind: Option<VideoKind>,
-    lock_video_kind: bool,
-    /// Whether to save the file as fast-start (moov-first). Initialized from
-    /// the opened file's current layout; the user can toggle it.
-    edit_fast_start: bool,
-    /// Selected video definition (`hdvd`) and its lock.
-    edit_definition: Option<Definition>,
     /// Detected video track dimensions (width, height) of the opened file.
     video_dimensions: Option<(u32, u32)>,
-    /// Progress of an ongoing shift-save: (bytes_done, bytes_total).
-    write_progress: Option<(u64, u64)>,
-    /// When set, show a "save complete" dialog with this message.
-    write_done_msg: Option<String>,
-    /// True while the current save is a shift/rewrite (vs in-place).
+    /// Whether to save the file as fast-start (moov-first).
+    edit_fast_start: bool,
+
+    /// Whether a thumbnail fetch has already been requested (lazy loading).
+    thumb_requested: Vec<bool>,
+
+    /// Persisted settings (license + tag counter + token).
+    settings: crate::license_mgr::Settings,
+
+    /// True while a save is a shift/rewrite (vs in-place), for the message.
     write_is_shift: bool,
-    /// True from when the user clicks "Write tags" until the write completes
-    /// (or errors). Disables the button so a write can't be launched twice.
     writing: bool,
 
-    /// The app icon texture (96×96), lazily created for the About/Splash
-    /// dialogs. `None` until first shown.
-    icon_tex: Option<egui::TextureHandle>,
-    /// True while the About dialog is open.
-    about_open: bool,
-    /// When the splash screen should stop showing. `Some(instant)` while the
-    /// splash is visible on startup; cleared when it closes (after 20s or on
-    /// click).
-    splash_until: Option<std::time::Instant>,
-    /// When the currently-visible splash was armed. Click-to-dismiss is ignored
-    /// until a short grace period after this, so the very click that spawns the
-    /// splash (e.g. OK on the completion dialog) doesn't instantly close it.
-    splash_shown_at: std::time::Instant,
-    /// Set when a tag-write hits the every-5th unlicensed nag. The donation
-    /// splash is deferred until the user dismisses the "Update complete"
-    /// dialog, so it isn't rendered underneath (and hidden by) that dialog.
+    /// Backing model for the poster grid (kept so thumbs can be updated in
+    /// place as they arrive).
+    posters: Rc<VecModel<PosterItem>>,
+    /// Lightbox target when the enlarged viewer is open.
+    lightbox: Option<Lightbox>,
+    /// Full-resolution artwork images for the lightbox, keyed by artwork index.
+    full_images: Vec<Option<slint::Image>>,
+    /// Whether a full-image fetch has already been requested, keyed by index.
+    full_requested: Vec<bool>,
+    /// Deferred donation splash: set on an unlicensed every-5th write, shown
+    /// once the "Update complete" dialog is dismissed.
     splash_pending: bool,
-
-    /// Persisted settings (license + tag counter), loaded at startup.
-    settings: crate::license_mgr::Settings,
-    /// True while the License Key dialog is open.
-    license_open: bool,
-    /// Email input in the License Key dialog.
-    license_email_input: String,
-    /// License-key input in the License Key dialog (may contain dashes).
-    license_key_input: String,
-    /// Transient status message shown in the License Key dialog.
-    license_msg: String,
-    /// True while the Settings dialog is open.
-    settings_open: bool,
-    /// TMDB Bearer token input in the Settings dialog.
-    settings_token_input: String,
-    /// True while the "TMDB credential required" message dialog is open
-    /// (shown when a search is attempted without any TMDB credential).
-    no_credential_open: bool,
 }
 
-impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = cc.egui_ctx.clone();
+/// Build the window, wire up the worker + callbacks, and run the event loop.
+pub fn run() -> Result<(), slint::PlatformError> {
+    let window = MainWindow::new()?;
 
-        // macOS: add application:openURLs: to winit's app delegate so Finder
-        // "Open With" / dock drops / double-clicks deliver files to us. Done
-        // here (not in main) because winit's delegate class only exists once
-        // the event loop has started. The queue is drained each frame in
-        // update().
-        #[cfg(target_os = "macos")]
-        crate::macos_open::install();
+    // macOS: (re)install the Open-Documents Apple Event handler now that the
+    // backend has created NSApplication, so it wins over AppKit's default
+    // routing. (main.rs also calls install() early; this is the effective one.)
+    #[cfg(target_os = "macos")]
+    crate::macos_open::install();
 
-        // Load persisted settings. When a valid license is present the startup
-        // splash is suppressed; otherwise it shows for 20 seconds.
-        let settings = crate::license_mgr::Settings::load();
-        let worker = Worker::spawn(settings.tmdb_bearer_token.clone(), move || {
-            ctx.request_repaint()
-        });
+    let settings = crate::license_mgr::Settings::load();
 
-        let splash_until = if settings.is_licensed() {
-            None
-        } else {
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(20))
-        };
+    // The worker wakes the UI thread from its own thread after each event; a
+    // Slint event-loop timer polls the channel (see below), so the repaint hook
+    // just nudges the loop awake.
+    let worker = Worker::spawn(settings.tmdb_bearer_token.clone(), || {
+        let _ = slint::invoke_from_event_loop(|| {});
+    });
 
-        // Prefill the Settings dialog's token field with the saved value.
-        let token_input = settings.tmdb_bearer_token.clone();
-
-        let app = Self {
-            worker,
-            file: None,
-            status: "Open an MP4/M4V file to begin.".into(),
-            file_loaded: false,
-            loading_details: false,
-            search_query: String::new(),
-            results: Vec::new(),
-            meta: None,
-            cover_thumb: None,
-            cover_full: None,
-            cover_size: None,
-            cover_bytes: None,
-            poster_selected: false,
-            thumbs: Vec::new(),
-            thumb_requested: Vec::new(),
-            selected_artwork: None,
-            lightbox: None,
-            full_images: Vec::new(),
-            edit_title: String::new(),
-            edit_year: String::new(),
-            edit_rating: String::new(),
-            edit_summary: String::new(),
-            edit_overview: String::new(),
-            edit_genres: String::new(),
-            edit_cast: String::new(),
-            edit_directors: String::new(),
-            edit_producers: String::new(),
-            edit_writers: String::new(),
-            edit_studio: String::new(),
-            lock_title: false,
-            lock_year: false,
-            lock_rating: false,
-            lock_summary: false,
-            lock_overview: false,
-            lock_genres: false,
-            lock_cast: false,
-            lock_directors: false,
-            lock_producers: false,
-            lock_writers: false,
-            lock_studio: false,
-            lock_poster: false,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            text_edit_pending: None,
-            last_text_focus: None,
-            edit_video_kind: None,
-            lock_video_kind: false,
-            edit_fast_start: false,
-            edit_definition: None,
-            video_dimensions: None,
-            write_progress: None,
-            write_done_msg: None,
-            write_is_shift: false,
-            writing: false,
-            icon_tex: None,
-            about_open: false,
-            // Suppressed at startup when licensed (computed above).
-            splash_until,
-            splash_shown_at: std::time::Instant::now(),
-            splash_pending: false,
-            settings,
-            license_open: false,
-            license_email_input: String::new(),
-            license_key_input: String::new(),
-            license_msg: String::new(),
-            settings_open: false,
-            settings_token_input: token_input,
-            no_credential_open: false,
-        };
-
-        // If launched with a movie file argument — Finder "Open With"/`open -a`
-        // on macOS, a `%U` handoff from the Linux .desktop association (which
-        // may be a file:// URI), or a path on the command line — open it.
-        if let Some(arg) = std::env::args_os().nth(1) {
-            if let Some(path) = arg_to_movie_path(&arg) {
-                let _ = app.worker.tx.send(Request::OpenFile { path });
-            }
+    // Launch-file argument (Finder "Open With", `open -a`, a path/`file://` URI
+    // from the Linux .desktop `%U`).
+    if let Some(arg) = std::env::args_os().nth(1) {
+        if let Some(path) = arg_to_movie_path(&arg) {
+            let _ = worker.tx.send(Request::OpenFile { path });
         }
-
-        app
     }
 
-    fn drain_events(&mut self, ctx: &egui::Context) {
-        while let Ok(evt) = self.worker.rx.try_recv() {
-            match evt {
-                Event::FileLoaded {
-                    file,
-                    meta,
-                    suggested_query,
-                    cover,
-                    cover_size,
-                    cover_bytes,
-                    video_dimensions,
-                    fast_start,
-                } => {
-                    self.file = Some(file);
-                    self.file_loaded = true;
-                    self.loading_details = false;
-                    self.search_query = suggested_query;
-                    self.results = Vec::new();
-                    self.cover_bytes = cover_bytes;
-                    self.cover_size = cover_size;
-                    self.video_dimensions = video_dimensions;
-                    self.edit_fast_start = fast_start;
-                    self.poster_selected = false;
-                    // Fresh file: reset undo history.
-                    self.undo_stack.clear();
-                    self.redo_stack.clear();
-                    self.text_edit_pending = None;
-                    // Prefill the editable fields from the file's existing tags.
-                    self.load_meta(*meta, false);
-                    // Current-file poster (one texture serves both the
-                    // thumbnail and the enlarged lightbox view).
-                    let cover_tex = cover.map(|(w, h, rgba)| {
-                        let color = egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            &rgba,
-                        );
-                        ctx.load_texture("cover", color, Default::default())
-                    });
-                    self.cover_thumb = cover_tex.clone();
-                    self.cover_full = cover_tex;
-                    self.status = "Edit fields, or search TMDB to fetch metadata.".into();
+    // Platform-conditional Help menu item.
+    window.set_show_install_cli(cfg!(target_os = "macos"));
+
+    let posters: Rc<VecModel<PosterItem>> = Rc::new(VecModel::default());
+    window.set_posters(ModelRc::from(posters.clone()));
+
+    let ctrl = Rc::new(RefCell::new(Controller {
+        worker,
+        file: None,
+        file_loaded: false,
+        loading_details: false,
+        meta: None,
+        results: Vec::new(),
+        cover_bytes: None,
+        cover_size: None,
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        text_edit_pending: None,
+        committed: empty_snapshot(),
+        video_dimensions: None,
+        edit_fast_start: false,
+        thumb_requested: Vec::new(),
+        settings,
+        write_is_shift: false,
+        writing: false,
+        posters,
+        lightbox: None,
+        full_images: Vec::new(),
+        full_requested: Vec::new(),
+        splash_pending: false,
+    }));
+
+    // App version + icon for the dialogs.
+    window.set_app_version(SharedString::from(env!("CARGO_PKG_VERSION")));
+    if let Some(icon) = load_app_icon() {
+        window.set_app_icon(icon.clone());
+        window.set_window_icon(icon);
+    }
+    // License state drives the About "thank you" and the startup splash.
+    let licensed = ctrl.borrow().settings.is_licensed();
+    window.set_about_licensed(licensed);
+
+    wire_callbacks(&window, &ctrl);
+
+    // Startup splash for unlicensed users (auto-dismisses after 20s via a
+    // one-shot timer; also dismissable by clicking the scrim/Close).
+    let splash_timer = slint::Timer::default();
+    if !licensed {
+        window.set_show_splash(true);
+        let handle = window.as_weak();
+        splash_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_secs(20),
+            move || {
+                if let Some(w) = handle.upgrade() {
+                    w.set_show_splash(false);
                 }
-                Event::CoverSet {
-                    width,
-                    height,
-                    rgba,
-                    orig_size,
-                    bytes,
-                } => {
-                    // Setting a poster is an undoable action.
-                    let before = self.snapshot();
-                    self.push_undo(before);
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
+            },
+        );
+    }
+
+    // macOS: install the native file drag-and-drop overlay once the native
+    // window (NSView) exists. Slint creates the surface lazily, so defer with a
+    // short one-shot timer after the loop starts.
+    #[cfg(target_os = "macos")]
+    let dnd_timer = slint::Timer::default();
+    #[cfg(target_os = "macos")]
+    {
+        let handle = window.as_weak();
+        dnd_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(200),
+            move || {
+                if let Some(w) = handle.upgrade() {
+                    install_native_drag_drop(&w);
+                }
+            },
+        );
+    }
+
+    // Poll the worker's event channel on the UI thread.
+    let drain_timer = slint::Timer::default();
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        drain_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(30),
+            move || {
+                if let Some(w) = handle.upgrade() {
+                    drain_events(&ctrl, &w);
+                }
+            },
+        );
+    }
+
+    window.run()
+}
+
+/// Register every UI callback against the controller.
+fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
+    // --- File / app ---
+    {
+        let ctrl = ctrl.clone();
+        window.on_open_file(move || {
+            let c = ctrl.borrow();
+            let _ = c.worker.tx.send(Request::PickFile);
+        });
+    }
+    window.on_open_settings({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                open_settings_dialog(&ctrl, &w);
+            }
+        }
+    });
+    window.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    window.on_open_license({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                open_license_dialog(&ctrl, &w);
+            }
+        }
+    });
+    window.on_install_cli({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                install_cli(&ctrl, &w);
+            }
+        }
+    });
+    window.on_open_about({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_about(true);
+            }
+        }
+    });
+
+    // --- Dialog callbacks ---
+    window.on_open_url(|url| {
+        let _ = webbrowser_open(&url);
+    });
+    window.on_about_ok({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_about(false);
+            }
+        }
+    });
+    window.on_splash_dismiss({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_splash(false);
+            }
+        }
+    });
+    window.on_license_cancel({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_license(false);
+            }
+        }
+    });
+    window.on_license_key_edited({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                // Reformat the key and recompute validity live.
+                let formatted = crate::license_mgr::format_key(&w.get_license_key());
+                if formatted != w.get_license_key().as_str() {
+                    w.set_license_key(SharedString::from(formatted.clone()));
+                }
+                let valid = crate::license_mgr::is_valid(&formatted, &w.get_license_email());
+                w.set_license_valid(valid);
+            }
+        }
+    });
+    window.on_license_save({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                license_save(&ctrl, &w);
+            }
+        }
+    });
+    window.on_settings_cancel({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_settings(false);
+            }
+        }
+    });
+    window.on_settings_save({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                settings_save(&ctrl, &w);
+            }
+        }
+    });
+    window.on_no_cred_ok({
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_no_credential(false);
+            }
+        }
+    });
+    window.on_no_cred_open_settings({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_no_credential(false);
+                open_settings_dialog(&ctrl, &w);
+            }
+        }
+    });
+    window.on_complete_ok({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_show_complete(false);
+                // Show a deferred donation splash now the dialog is dismissed.
+                if ctrl.borrow().splash_pending {
+                    ctrl.borrow_mut().splash_pending = false;
+                    w.set_show_splash(true);
+                }
+            }
+        }
+    });
+    window.on_lightbox_close({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                ctrl.borrow_mut().lightbox = None;
+                w.set_show_lightbox(false);
+            }
+        }
+    });
+
+    // --- Edit menu ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_undo(move || {
+            if let Some(w) = handle.upgrade() {
+                undo(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_redo(move || {
+            if let Some(w) = handle.upgrade() {
+                redo(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_cut(move || {
+            if let Some(w) = handle.upgrade() {
+                cut_poster(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_copy(move || {
+            if let Some(w) = handle.upgrade() {
+                copy_poster(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_paste(move || {
+            if let Some(w) = handle.upgrade() {
+                paste_poster(&ctrl, &w);
+            }
+        });
+    }
+
+    // --- Search ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_do_search(move || {
+            if let Some(w) = handle.upgrade() {
+                start_search(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_select_match(move |idx| {
+            if let Some(w) = handle.upgrade() {
+                select_match(&ctrl, &w, idx);
+            }
+        });
+    }
+
+    // --- Field edits (coalesced undo) ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_field_edited(move || {
+            if let Some(w) = handle.upgrade() {
+                on_field_edited(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_field_commit(move || {
+            if let Some(w) = handle.upgrade() {
+                commit_text_edit(&ctrl, &w);
+                update_undo_redo(&ctrl, &w);
+            }
+        });
+    }
+
+    // --- Dropdowns / fast-start (each is a discrete, undoable change) ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_video_kind_changed(move |_idx| {
+            if let Some(w) = handle.upgrade() {
+                discrete_change(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_definition_changed(move |_idx| {
+            if let Some(w) = handle.upgrade() {
+                discrete_change(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_rating_changed(move |_idx| {
+            if let Some(w) = handle.upgrade() {
+                discrete_change(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_fast_start_changed(move |on| {
+            ctrl.borrow_mut().edit_fast_start = on;
+            if let Some(w) = handle.upgrade() {
+                let _ = w; // fast-start isn't part of the undo snapshot
+            }
+        });
+    }
+
+    // --- Current-cover poster interactions ---
+    {
+        let handle = window.as_weak();
+        window.on_poster_clicked(move || {
+            if let Some(w) = handle.upgrade() {
+                // Toggle selection of the current poster (enables Cut/Copy).
+                w.set_poster_selected(!w.get_poster_selected());
+            }
+        });
+    }
+    window.on_poster_double_clicked({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                open_current_cover_lightbox(&ctrl, &w);
+            }
+        }
+    });
+
+    // --- TMDB poster grid ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_poster_choice_clicked(move |idx| {
+            if let Some(w) = handle.upgrade() {
+                poster_choice_clicked(&ctrl, &w, idx);
+            }
+        });
+    }
+    window.on_poster_choice_double_clicked({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move |idx| {
+            if let Some(w) = handle.upgrade() {
+                open_tmdb_lightbox(&ctrl, &w, idx);
+            }
+        }
+    });
+
+    // --- Write ---
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_write_tags(move || {
+            if let Some(w) = handle.upgrade() {
+                write_tags(&ctrl, &w);
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker event draining
+// ---------------------------------------------------------------------------
+
+fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    // macOS: pick up any files delivered via the "Open Documents" Apple Event
+    // (Finder "Open With", dock drops, double-click) that aren't surfaced as a
+    // launch argument. Drained here since this runs on the UI thread every tick.
+    #[cfg(target_os = "macos")]
+    {
+        for path in crate::macos_open::take_pending() {
+            if is_movie_path(&path) && path.exists() {
+                let c = ctrl.borrow();
+                let _ = c.worker.tx.send(Request::OpenFile { path });
+                drop(c);
+                w.set_status(SharedString::from("Opening file…"));
+            }
+        }
+        // Image files dropped on the window replace the current poster (unless
+        // locked / no file open), mirroring the egui drop behavior.
+        for path in crate::macos_open::take_pending_images() {
+            if !w.get_file_loaded() || w.get_lock_poster() {
+                continue;
+            }
+            if is_image_path(&path) {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    set_cover_from_bytes_undoable(ctrl, w, bytes);
+                    w.set_status(SharedString::from("Poster replaced from dropped image."));
+                }
+            }
+        }
+    }
+
+    loop {
+        let evt = {
+            let c = ctrl.borrow();
+            match c.worker.rx.try_recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            }
+        };
+        match evt {
+            Event::FileLoaded {
+                file,
+                meta,
+                suggested_query,
+                cover,
+                cover_size,
+                cover_bytes,
+                video_dimensions,
+                fast_start,
+            } => {
+                {
+                    let mut c = ctrl.borrow_mut();
+                    c.file = Some(file);
+                    c.file_loaded = true;
+                    c.loading_details = false;
+                    c.results = Vec::new();
+                    c.cover_bytes = cover_bytes;
+                    c.cover_size = cover_size;
+                    c.video_dimensions = video_dimensions;
+                    c.edit_fast_start = fast_start;
+                    c.undo_stack.clear();
+                    c.redo_stack.clear();
+                    c.text_edit_pending = None;
+                }
+                w.set_file_loaded(true);
+                w.set_loading_details(false);
+                w.set_poster_selected(false);
+                w.set_search_query(SharedString::from(suggested_query));
+                w.set_fast_start(fast_start);
+                set_matches(ctrl, w);
+                // Current cover display + size caption.
+                match cover {
+                    Some((cw, ch, rgba)) => {
+                        w.set_cover_image(rgba_to_image(cw, ch, &rgba));
+                        w.set_has_cover(true);
+                    }
+                    None => w.set_has_cover(false),
+                }
+                w.set_video_dimensions(SharedString::from(dims_caption(video_dimensions)));
+                w.set_cover_size_caption(SharedString::from(size_caption(cover_size)));
+                // Prefill editable fields (all fields — respect_locks=false).
+                load_meta(ctrl, w, *meta, false);
+                w.set_status(SharedString::from(
+                    "Edit fields, or search TMDB to fetch metadata.",
+                ));
+            }
+            Event::CoverSet {
+                width,
+                height,
+                rgba,
+                orig_size,
+                bytes,
+            } => {
+                // Setting a poster is an undoable action.
+                let before = snapshot(ctrl, w);
+                push_undo(ctrl, w, before);
+                {
+                    let mut c = ctrl.borrow_mut();
+                    c.cover_size = Some(orig_size);
+                    c.cover_bytes = Some(bytes);
+                }
+                w.set_cover_image(rgba_to_image(width, height, &rgba));
+                w.set_has_cover(true);
+                w.set_cover_size_caption(SharedString::from(size_caption(Some(orig_size))));
+                w.set_status(SharedString::from("Poster set as current."));
+                update_undo_redo(ctrl, w);
+            }
+            Event::SearchDone { results } => {
+                {
+                    let mut c = ctrl.borrow_mut();
+                    c.results = results;
+                }
+                let n = ctrl.borrow().results.len();
+                w.set_status(SharedString::from(format!("{n} match(es).")));
+                set_matches(ctrl, w);
+            }
+            Event::DetailsDone { meta } => {
+                ctrl.borrow_mut().loading_details = false;
+                w.set_loading_details(false);
+                load_meta(ctrl, w, *meta, true);
+                w.set_status(SharedString::from(
+                    "Details loaded. Edit fields and pick a poster.",
+                ));
+            }
+            Event::ThumbDone {
+                index,
+                width,
+                height,
+                rgba,
+            } => {
+                let c = ctrl.borrow();
+                if index < c.posters.row_count() {
+                    c.posters.set_row_data(
+                        index,
+                        PosterItem {
+                            image: rgba_to_image(width, height, &rgba),
+                            loaded: true,
+                        },
                     );
-                    let tex = ctx.load_texture("cover", color, Default::default());
-                    self.cover_thumb = Some(tex.clone());
-                    self.cover_full = Some(tex);
-                    self.cover_size = Some(orig_size);
-                    self.cover_bytes = Some(bytes);
-                    self.status = "Poster set as current.".into();
                 }
-                Event::SearchDone { results } => {
-                    self.status = format!("{} match(es).", results.len());
-                    self.results = results;
-                }
-                Event::DetailsDone { meta } => {
-                    // Merge fetched details into the editable fields and load
-                    // candidate posters. Thumbnails are fetched lazily as their
-                    // grid cells scroll into view (see poster_grid).
-                    self.loading_details = false;
-                    self.load_meta(*meta, true);
-                    self.status = "Details loaded. Edit fields and pick a poster.".into();
-                }
-                Event::ThumbDone {
-                    index,
-                    width,
-                    height,
-                    rgba,
-                } => {
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    );
-                    let handle =
-                        ctx.load_texture(format!("poster{index}"), color, Default::default());
-                    if index < self.thumbs.len() {
-                        self.thumbs[index] = Some(handle);
+            }
+            Event::FullImageDone {
+                index,
+                width,
+                height,
+                rgba,
+            } => {
+                let img = rgba_to_image(width, height, &rgba);
+                {
+                    let mut c = ctrl.borrow_mut();
+                    if index < c.full_images.len() {
+                        c.full_images[index] = Some(img.clone());
                     }
                 }
-                Event::FullImageDone {
-                    index,
-                    width,
-                    height,
-                    rgba,
-                } => {
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    );
-                    let handle =
-                        ctx.load_texture(format!("full{index}"), color, Default::default());
-                    if index < self.full_images.len() {
-                        self.full_images[index] = Some(handle);
-                    }
+                // If the lightbox is currently showing this TMDB image, update it.
+                if ctrl.borrow().lightbox == Some(Lightbox::Tmdb(index)) {
+                    w.set_lightbox_image(img);
+                    w.set_lightbox_loaded(true);
                 }
-                Event::WriteDone { file } => {
-                    self.write_progress = None;
-                    self.writing = false;
+            }
+            Event::WriteDone { file } => {
+                let (name, how, show_splash) = {
+                    let mut c = ctrl.borrow_mut();
+                    c.writing = false;
                     let name = file
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("file")
                         .to_string();
-                    let how = if self.write_is_shift {
+                    let how = if c.write_is_shift {
                         "rewritten (media shifted)"
                     } else {
                         "updated in place"
                     };
-                    self.write_done_msg = Some(format!("“{name}” was {how}."));
-                    self.status = format!("Saved: {name}");
-                    self.write_is_shift = false;
-
-                    // Count each successful tag-write and persist it. For
-                    // unlicensed users, show the donation splash for 20s every
-                    // 5th write. Licensed users are never nagged.
-                    self.settings.tag_count = self.settings.tag_count.wrapping_add(1);
-                    let _ = self.settings.save();
-                    if !self.settings.is_licensed() && self.settings.tag_count % 5 == 0 {
-                        // Defer the splash until the user dismisses the
-                        // "Update complete" dialog; otherwise the splash renders
-                        // underneath that dialog and can't be seen.
-                        self.splash_pending = true;
-                    }
-                }
-                Event::WriteStarted => {
-                    self.write_progress = Some((0, 0));
-                    self.write_is_shift = true;
-                    self.status = "Saving (shifting media)…".into();
-                }
-                Event::WriteProgress(done, total) => {
-                    self.write_progress = Some((done, total));
-                }
-                Event::Error(e) => {
-                    self.loading_details = false;
-                    self.write_progress = None;
-                    self.write_is_shift = false;
-                    self.writing = false;
-                    self.status = format!("Error: {e}");
-                }
+                    c.write_is_shift = false;
+                    // Count each successful write and persist it. Unlicensed
+                    // users see the donation splash every 5th write, deferred
+                    // until the completion dialog is dismissed.
+                    c.settings.tag_count = c.settings.tag_count.wrapping_add(1);
+                    let _ = c.settings.save();
+                    let show_splash = !c.settings.is_licensed() && c.settings.tag_count % 5 == 0;
+                    c.splash_pending = show_splash;
+                    (name, how, show_splash)
+                };
+                let _ = show_splash;
+                w.set_writing(false);
+                w.set_show_progress(false);
+                w.set_status(SharedString::from(format!("Saved: {name}")));
+                w.set_complete_msg(SharedString::from(format!("“{name}” was {how}.")));
+                w.set_show_complete(true);
             }
-        }
-    }
-
-    /// Capture the current editable state as a snapshot.
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            title: self.edit_title.clone(),
-            year: self.edit_year.clone(),
-            video_kind: self.edit_video_kind,
-            definition: self.edit_definition,
-            rating: self.edit_rating.clone(),
-            summary: self.edit_summary.clone(),
-            overview: self.edit_overview.clone(),
-            genres: self.edit_genres.clone(),
-            cast: self.edit_cast.clone(),
-            directors: self.edit_directors.clone(),
-            producers: self.edit_producers.clone(),
-            writers: self.edit_writers.clone(),
-            studio: self.edit_studio.clone(),
-            cover_bytes: self.cover_bytes.clone(),
-            cover_size: self.cover_size,
-        }
-    }
-
-    /// Push the given "before" snapshot onto the undo stack and clear redo.
-    /// Call this right before applying a discrete change (poster set, cut,
-    /// paste). No-op if the snapshot equals the current state.
-    fn push_undo(&mut self, before: Snapshot) {
-        // Flush any pending coalesced text edit first so ordering is correct.
-        self.commit_text_edit();
-        self.undo_stack.push(before);
-        self.redo_stack.clear();
-    }
-
-    /// Commit a pending coalesced text edit to the undo stack if the state
-    /// actually changed since the edit began.
-    fn commit_text_edit(&mut self) {
-        if let Some(before) = self.text_edit_pending.take() {
-            if before != self.snapshot() {
-                self.undo_stack.push(before);
-                self.redo_stack.clear();
+            Event::WriteStarted => {
+                ctrl.borrow_mut().write_is_shift = true;
+                w.set_status(SharedString::from("Saving (shifting media)…"));
+                w.set_progress_fraction(0.0);
+                w.set_progress_caption(SharedString::from(""));
+                w.set_show_progress(true);
             }
-        }
-    }
-
-    fn undo(&mut self, ctx: &egui::Context) {
-        self.commit_text_edit();
-        if let Some(prev) = self.undo_stack.pop() {
-            let current = self.snapshot();
-            self.redo_stack.push(current);
-            self.apply_snapshot(ctx, prev);
-            self.status = "Undo.".into();
-        }
-    }
-
-    fn redo(&mut self, ctx: &egui::Context) {
-        self.commit_text_edit();
-        if let Some(next) = self.redo_stack.pop() {
-            let current = self.snapshot();
-            self.undo_stack.push(current);
-            self.apply_snapshot(ctx, next);
-            self.status = "Redo.".into();
-        }
-    }
-
-    /// Restore a snapshot into the live fields, regenerating the cover texture.
-    fn apply_snapshot(&mut self, ctx: &egui::Context, s: Snapshot) {
-        self.edit_title = s.title;
-        self.edit_year = s.year;
-        self.edit_video_kind = s.video_kind;
-        self.edit_definition = s.definition;
-        self.edit_rating = s.rating;
-        self.edit_summary = s.summary;
-        self.edit_overview = s.overview;
-        self.edit_genres = s.genres;
-        self.edit_cast = s.cast;
-        self.edit_directors = s.directors;
-        self.edit_producers = s.producers;
-        self.edit_writers = s.writers;
-        self.edit_studio = s.studio;
-        self.cover_size = s.cover_size;
-        self.set_cover_bytes(ctx, s.cover_bytes);
-    }
-
-    /// Set the cover to the given encoded bytes (or clear it) and regenerate
-    /// the display textures. Does not touch undo history.
-    fn set_cover_bytes(&mut self, ctx: &egui::Context, bytes: Option<Vec<u8>>) {
-        match &bytes {
-            Some(b) => {
-                if let Ok(img) = tagtiger_core::artwork::thumbnail(b, 1000) {
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [img.width as usize, img.height as usize],
-                        &img.rgba,
-                    );
-                    let tex = ctx.load_texture("cover", color, Default::default());
-                    self.cover_thumb = Some(tex.clone());
-                    self.cover_full = Some(tex);
+            Event::WriteProgress(done, total) => {
+                let frac = if total > 0 {
+                    done as f32 / total as f32
+                } else {
+                    0.0
+                };
+                w.set_progress_fraction(frac);
+                if total > 0 {
+                    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+                    w.set_progress_caption(SharedString::from(format!(
+                        "{:.0} / {:.0} MiB",
+                        mb(done),
+                        mb(total)
+                    )));
                 }
             }
-            None => {
-                self.cover_thumb = None;
-                self.cover_full = None;
+            Event::Error(e) => {
+                {
+                    let mut c = ctrl.borrow_mut();
+                    c.loading_details = false;
+                    c.write_is_shift = false;
+                    c.writing = false;
+                }
+                w.set_loading_details(false);
+                w.set_writing(false);
+                w.set_show_progress(false);
+                w.set_status(SharedString::from(format!("Error: {e}")));
             }
         }
-        self.cover_bytes = bytes;
-    }
-
-    /// Menu "Cut": route to the given focused text field (re-focus it and
-    /// inject an egui Cut event), otherwise cut the poster.
-    fn menu_cut(&mut self, ctx: &egui::Context, focus: Option<egui::Id>) {
-        if let Some(id) = focus {
-            ctx.memory_mut(|m| m.request_focus(id));
-            ctx.input_mut(|i| i.events.push(egui::Event::Cut));
-            ctx.request_repaint();
-        } else if self.poster_selected {
-            self.cut_poster(ctx);
-        }
-    }
-
-    /// Menu "Copy": route to the focused text field, otherwise copy the poster.
-    fn menu_copy(&mut self, ctx: &egui::Context, focus: Option<egui::Id>) {
-        if let Some(id) = focus {
-            ctx.memory_mut(|m| m.request_focus(id));
-            ctx.input_mut(|i| i.events.push(egui::Event::Copy));
-            ctx.request_repaint();
-        } else if self.poster_selected {
-            self.copy_poster();
-        }
-    }
-
-    /// Menu "Paste": into the focused text field (inject clipboard text as an
-    /// egui Paste event), otherwise paste an image as the poster.
-    fn menu_paste(&mut self, ctx: &egui::Context, focus: Option<egui::Id>) {
-        if let Some(id) = focus {
-            if let Some(text) = read_clipboard_text() {
-                ctx.memory_mut(|m| m.request_focus(id));
-                ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
-                ctx.request_repaint();
-            }
-        } else {
-            self.paste_poster(ctx);
-        }
-    }
-
-    /// Copy the current poster to the system clipboard as an image.
-    fn copy_poster(&mut self) {
-        if let Some(bytes) = &self.cover_bytes {
-            if write_clipboard_image(bytes).is_ok() {
-                self.status = "Poster copied to clipboard.".into();
-            } else {
-                self.status = "Failed to copy poster.".into();
-            }
-        } else {
-            self.status = "No poster to copy.".into();
-        }
-    }
-
-    /// Cut the current poster: copy to clipboard, then clear it (undoable).
-    fn cut_poster(&mut self, ctx: &egui::Context) {
-        if self.cover_bytes.is_none() {
-            self.status = "No poster to cut.".into();
-            return;
-        }
-        if self.lock_poster {
-            self.status = "Poster is locked.".into();
-            return;
-        }
-        if let Some(bytes) = &self.cover_bytes {
-            let _ = write_clipboard_image(bytes);
-        }
-        let before = self.snapshot();
-        self.push_undo(before);
-        self.set_cover_bytes(ctx, None);
-        self.cover_size = None;
-        self.status = "Poster cut.".into();
-    }
-
-    /// Delete the current poster without touching the clipboard (undoable).
-    /// Used by the Delete/Backspace key when the poster is selected.
-    fn delete_poster(&mut self, ctx: &egui::Context) {
-        if self.cover_bytes.is_none() {
-            self.status = "No poster to delete.".into();
-            return;
-        }
-        if self.lock_poster {
-            self.status = "Poster is locked.".into();
-            return;
-        }
-        let before = self.snapshot();
-        self.push_undo(before);
-        self.set_cover_bytes(ctx, None);
-        self.cover_size = None;
-        self.poster_selected = false;
-        self.status = "Poster deleted.".into();
-    }
-
-    /// Paste an image from the clipboard as the current poster (undoable).
-    fn paste_poster(&mut self, ctx: &egui::Context) {
-        if self.lock_poster {
-            self.status = "Poster is locked.".into();
-            return;
-        }
-        if let Some(bytes) = read_clipboard_image_png() {
-            self.set_cover_from_bytes_undoable(ctx, bytes);
-            self.status = "Poster pasted.".into();
-        } else {
-            self.status = "No image on clipboard.".into();
-        }
-    }
-
-    /// Replace the current poster with the given encoded bytes, pushing an undo
-    /// step and updating the size caption.
-    fn set_cover_from_bytes_undoable(&mut self, ctx: &egui::Context, bytes: Vec<u8>) {
-        let before = self.snapshot();
-        self.push_undo(before);
-        self.cover_size = tagtiger_core::artwork::dimensions(&bytes).ok();
-        self.set_cover_bytes(ctx, Some(bytes));
-    }
-
-    /// Populate the editable buffers from `meta`. When `respect_locks` is true
-    /// (a new match's details), locked fields are left untouched; when false
-    /// (initial file load) all fields are set.
-    fn load_meta(&mut self, meta: MediaMetadata, respect_locks: bool) {
-        if !(respect_locks && self.lock_title) {
-            self.edit_title = meta.title.clone();
-        }
-        if !(respect_locks && self.lock_video_kind) {
-            self.edit_video_kind = meta.video_kind;
-        }
-        // Definition is only set on the initial file load. Selecting a TMDB
-        // match must never change it — the definition comes from the file (or
-        // the video track's dimensions), not from the chosen match — so it is
-        // left untouched whenever `respect_locks` is true.
-        if !respect_locks {
-            self.edit_definition = meta.definition;
-        }
-        if !(respect_locks && self.lock_year) {
-            self.edit_year = meta
-                .release_date
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_default();
-        }
-        if !(respect_locks && self.lock_rating) {
-            self.edit_rating = meta.content_rating.clone().unwrap_or_default();
-        }
-        if !(respect_locks && self.lock_summary) {
-            self.edit_summary = meta.summary.clone().unwrap_or_default();
-        }
-        if !(respect_locks && self.lock_overview) {
-            self.edit_overview = meta.overview.clone().unwrap_or_default();
-        }
-        if !(respect_locks && self.lock_genres) {
-            self.edit_genres = meta.genres.join(", ");
-        }
-        if !(respect_locks && self.lock_cast) {
-            self.edit_cast = meta
-                .cast
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-        }
-        if !(respect_locks && self.lock_directors) {
-            self.edit_directors = meta
-                .directors
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-        }
-        if !(respect_locks && self.lock_producers) {
-            self.edit_producers = meta
-                .producers
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-        }
-        if !(respect_locks && self.lock_writers) {
-            self.edit_writers = meta
-                .writers
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-        }
-        if !(respect_locks && self.lock_studio) {
-            self.edit_studio = meta.studio.clone().unwrap_or_default();
-        }
-
-        self.thumbs = vec![None; meta.artwork.len()];
-        self.thumb_requested = vec![false; meta.artwork.len()];
-        self.full_images = vec![None; meta.artwork.len()];
-        self.lightbox = None;
-        // Never auto-select a poster. If the poster is locked, keep any prior
-        // selection/custom cover; otherwise clear the selection.
-        if !(respect_locks && self.lock_poster) {
-            self.selected_artwork = None;
-        }
-        self.meta = Some(meta);
-    }
-
-    /// Rebuild a MediaMetadata from the edited buffers before writing.
-    fn collect_edited(&self) -> Option<MediaMetadata> {
-        let base = self.meta.clone()?;
-        use tagtiger_core::model::Person;
-        let mut m = base;
-        m.title = self.edit_title.clone();
-        m.video_kind = self.edit_video_kind;
-        m.definition = self.edit_definition;
-        m.release_date = chrono::NaiveDate::parse_from_str(self.edit_year.trim(), "%Y-%m-%d").ok();
-        m.content_rating = if self.edit_rating.trim().is_empty() {
-            None
-        } else {
-            Some(self.edit_rating.clone())
-        };
-        m.summary = if self.edit_summary.trim().is_empty() {
-            None
-        } else {
-            // Enforce the 255-character limit on the short summary.
-            Some(self.edit_summary.chars().take(255).collect())
-        };
-        m.overview = if self.edit_overview.trim().is_empty() {
-            None
-        } else {
-            Some(self.edit_overview.clone())
-        };
-        m.genres = split_csv(&self.edit_genres);
-        m.cast = split_csv(&self.edit_cast)
-            .into_iter()
-            .map(Person::new)
-            .collect();
-        m.directors = split_csv(&self.edit_directors)
-            .into_iter()
-            .map(Person::new)
-            .collect();
-        m.producers = split_csv(&self.edit_producers)
-            .into_iter()
-            .map(Person::new)
-            .collect();
-        m.writers = split_csv(&self.edit_writers)
-            .into_iter()
-            .map(Person::new)
-            .collect();
-        m.studio = if self.edit_studio.trim().is_empty() {
-            None
-        } else {
-            Some(self.edit_studio.trim().to_string())
-        };
-        Some(m)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Matches list
+// ---------------------------------------------------------------------------
+
+fn set_matches(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let items: Vec<MatchItem> = ctrl
+        .borrow()
+        .results
+        .iter()
+        .map(|r| MatchItem {
+            title: SharedString::from(r.title.clone()),
+            year: SharedString::from(r.year.map(|y| y.to_string()).unwrap_or_default()),
+        })
+        .collect();
+    w.set_matches(ModelRc::new(VecModel::from(items)));
+}
+
+fn select_match(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
+    if idx < 0 {
+        return;
+    }
+    let idx = idx as usize;
+    let (id, file) = {
+        let c = ctrl.borrow();
+        if c.loading_details {
+            return;
+        }
+        let Some(r) = c.results.get(idx) else {
+            return;
+        };
+        let Some(file) = c.file.clone() else {
+            return;
+        };
+        (
+            ProviderId {
+                provider: r.id.provider.clone(),
+                id: r.id.id.clone(),
+                kind: r.id.kind,
+            },
+            file,
+        )
+    };
+    ctrl.borrow_mut().loading_details = true;
+    w.set_loading_details(true);
+    w.set_status(SharedString::from("Loading details…"));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::FetchDetails { id, file });
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo + snapshots
+// ---------------------------------------------------------------------------
+
+/// Capture the current editable state (read from the window properties).
+fn snapshot(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) -> Snapshot {
+    let c = ctrl.borrow();
+    Snapshot {
+        title: w.get_title_text().to_string(),
+        year: w.get_year_text().to_string(),
+        video_kind: index_to_video_kind(w.get_video_kind_index()),
+        definition: index_to_definition(w.get_definition_index()),
+        rating: index_to_rating(w.get_rating_index()),
+        summary: w.get_summary_text().to_string(),
+        overview: w.get_overview_text().to_string(),
+        genres: w.get_genres_text().to_string(),
+        cast: w.get_cast_text().to_string(),
+        directors: w.get_directors_text().to_string(),
+        producers: w.get_producers_text().to_string(),
+        writers: w.get_writers_text().to_string(),
+        studio: w.get_studio_text().to_string(),
+        cover_bytes: c.cover_bytes.clone(),
+        cover_size: c.cover_size,
+    }
+}
+
+/// Push a "before" snapshot onto the undo stack and clear redo. Flushes any
+/// pending coalesced text edit first so ordering is correct. Refreshes the
+/// committed baseline to the current state.
+fn push_undo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, before: Snapshot) {
+    commit_text_edit(ctrl, w);
+    {
+        let mut c = ctrl.borrow_mut();
+        c.undo_stack.push(before);
+        c.redo_stack.clear();
+    }
+    refresh_committed(ctrl, w);
+}
+
+/// Refresh the committed baseline to the current live state.
+fn refresh_committed(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let s = snapshot(ctrl, w);
+    ctrl.borrow_mut().committed = s;
+}
+
+/// Commit a pending coalesced text edit if the state changed since it began.
+fn commit_text_edit(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let pending = ctrl.borrow_mut().text_edit_pending.take();
+    if let Some(before) = pending {
+        let now = snapshot(ctrl, w);
+        if before != now {
+            let mut c = ctrl.borrow_mut();
+            c.undo_stack.push(before);
+            c.redo_stack.clear();
+            c.committed = now;
+        }
+    }
+}
+
+/// Any field edit: capture a pre-edit snapshot on the first change of a run.
+fn on_field_edited(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    // Editing a text field deselects the current poster (matches egui).
+    w.set_poster_selected(false);
+    // Enforce the 255-char summary limit as the user types.
+    let s = w.get_summary_text();
+    if s.chars().count() > 255 {
+        let clipped: String = s.chars().take(255).collect();
+        w.set_summary_text(SharedString::from(clipped));
+    }
+    // On the first keystroke of a run, remember the committed baseline as the
+    // "before" state for a single coalesced undo step.
+    if ctrl.borrow().text_edit_pending.is_none() {
+        let before = ctrl.borrow().committed.clone();
+        ctrl.borrow_mut().text_edit_pending = Some(before);
+    }
+    update_undo_redo(ctrl, w);
+}
+
+/// A discrete (non-text) change such as a dropdown selection. The two-way bind
+/// has already applied the new value to the property, so the pre-change state
+/// is taken from the committed baseline (see `Controller::committed`). Any
+/// in-flight text edit is flushed first so ordering is correct.
+fn discrete_change(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    commit_text_edit(ctrl, w);
+    let before = ctrl.borrow().committed.clone();
+    let now = snapshot(ctrl, w);
+    if before != now {
+        let mut c = ctrl.borrow_mut();
+        c.undo_stack.push(before);
+        c.redo_stack.clear();
+        c.committed = now;
+    }
+    update_undo_redo(ctrl, w);
+}
+
+fn undo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    commit_text_edit(ctrl, w);
+    let prev = ctrl.borrow_mut().undo_stack.pop();
+    if let Some(prev) = prev {
+        let current = snapshot(ctrl, w);
+        ctrl.borrow_mut().redo_stack.push(current);
+        apply_snapshot(ctrl, w, prev);
+        refresh_committed(ctrl, w);
+        w.set_status(SharedString::from("Undo."));
+    }
+    update_undo_redo(ctrl, w);
+}
+
+fn redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    commit_text_edit(ctrl, w);
+    let next = ctrl.borrow_mut().redo_stack.pop();
+    if let Some(next) = next {
+        let current = snapshot(ctrl, w);
+        ctrl.borrow_mut().undo_stack.push(current);
+        apply_snapshot(ctrl, w, next);
+        refresh_committed(ctrl, w);
+        w.set_status(SharedString::from("Redo."));
+    }
+    update_undo_redo(ctrl, w);
+}
+
+/// Restore a snapshot into the live properties, regenerating the cover image.
+fn apply_snapshot(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, s: Snapshot) {
+    w.set_title_text(SharedString::from(s.title));
+    w.set_year_text(SharedString::from(s.year));
+    w.set_video_kind_index(video_kind_to_index(s.video_kind));
+    w.set_definition_index(definition_to_index(s.definition));
+    w.set_rating_index(rating_to_index(&s.rating));
+    w.set_summary_text(SharedString::from(s.summary));
+    w.set_overview_text(SharedString::from(s.overview));
+    w.set_genres_text(SharedString::from(s.genres));
+    w.set_cast_text(SharedString::from(s.cast));
+    w.set_directors_text(SharedString::from(s.directors));
+    w.set_producers_text(SharedString::from(s.producers));
+    w.set_writers_text(SharedString::from(s.writers));
+    w.set_studio_text(SharedString::from(s.studio));
+    ctrl.borrow_mut().cover_size = s.cover_size;
+    set_cover_bytes(ctrl, w, s.cover_bytes);
+    w.set_cover_size_caption(SharedString::from(size_caption(s.cover_size)));
+}
+
+/// Set the cover to the given encoded bytes (or clear it) and regenerate the
+/// display image. Does not touch undo history.
+fn set_cover_bytes(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, bytes: Option<Vec<u8>>) {
+    match &bytes {
+        Some(b) => {
+            if let Ok(img) = tagtiger_core::artwork::thumbnail(b, 1000) {
+                w.set_cover_image(rgba_to_image(img.width, img.height, &img.rgba));
+                w.set_has_cover(true);
+            }
+        }
+        None => {
+            w.set_cover_image(slint::Image::default());
+            w.set_has_cover(false);
+        }
+    }
+    ctrl.borrow_mut().cover_bytes = bytes;
+}
+
+fn update_undo_redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let c = ctrl.borrow();
+    w.set_can_undo(!c.undo_stack.is_empty() || c.text_edit_pending.is_some());
+    w.set_can_redo(!c.redo_stack.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Poster clipboard / grid
+// ---------------------------------------------------------------------------
+
+fn copy_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let bytes = ctrl.borrow().cover_bytes.clone();
+    let msg = match bytes {
+        Some(b) if write_clipboard_image(&b).is_ok() => "Poster copied to clipboard.",
+        Some(_) => "Failed to copy poster.",
+        None => "No poster to copy.",
+    };
+    w.set_status(SharedString::from(msg));
+}
+
+fn cut_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let (has, locked, bytes) = {
+        let c = ctrl.borrow();
+        (c.cover_bytes.is_some(), w.get_lock_poster(), c.cover_bytes.clone())
+    };
+    if !has {
+        w.set_status(SharedString::from("No poster to cut."));
+        return;
+    }
+    if locked {
+        w.set_status(SharedString::from("Poster is locked."));
+        return;
+    }
+    if let Some(b) = &bytes {
+        let _ = write_clipboard_image(b);
+    }
+    let before = snapshot(ctrl, w);
+    push_undo(ctrl, w, before);
+    set_cover_bytes(ctrl, w, None);
+    ctrl.borrow_mut().cover_size = None;
+    w.set_cover_size_caption(SharedString::from(size_caption(None)));
+    w.set_status(SharedString::from("Poster cut."));
+    update_undo_redo(ctrl, w);
+}
+
+fn paste_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    if w.get_lock_poster() {
+        w.set_status(SharedString::from("Poster is locked."));
+        return;
+    }
+    if let Some(bytes) = read_clipboard_image_png() {
+        set_cover_from_bytes_undoable(ctrl, w, bytes);
+        w.set_status(SharedString::from("Poster pasted."));
+    } else {
+        w.set_status(SharedString::from("No image on clipboard."));
+    }
+}
+
+fn set_cover_from_bytes_undoable(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, bytes: Vec<u8>) {
+    let before = snapshot(ctrl, w);
+    push_undo(ctrl, w, before);
+    let size = tagtiger_core::artwork::dimensions(&bytes).ok();
+    ctrl.borrow_mut().cover_size = size;
+    set_cover_bytes(ctrl, w, Some(bytes));
+    w.set_cover_size_caption(SharedString::from(size_caption(size)));
+    update_undo_redo(ctrl, w);
+}
+
+fn poster_choice_clicked(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
+    if idx < 0 || w.get_lock_poster() {
+        return;
+    }
+    let idx = idx as usize;
+    let url = {
+        let c = ctrl.borrow();
+        c.meta
+            .as_ref()
+            .and_then(|m| m.artwork.get(idx))
+            .map(|a| a.url.clone())
+    };
+    if let Some(url) = url {
+        w.set_poster_selected(false);
+        w.set_status(SharedString::from("Setting poster…"));
+        let c = ctrl.borrow();
+        let _ = c.worker.tx.send(Request::SetCoverFromUrl { url });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// load_meta / collect_edited
+// ---------------------------------------------------------------------------
+
+/// Populate the editable properties from `meta`. When `respect_locks` is true
+/// (a new match's details), locked fields are left untouched; when false
+/// (initial file load) all fields are set.
+fn load_meta(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, meta: MediaMetadata, respect_locks: bool) {
+    if !(respect_locks && w.get_lock_title()) {
+        w.set_title_text(SharedString::from(meta.title.clone()));
+    }
+    if !(respect_locks && w.get_lock_video_kind()) {
+        w.set_video_kind_index(video_kind_to_index(meta.video_kind));
+    }
+    // Definition is only set on the initial file load; selecting a TMDB match
+    // never changes it.
+    if !respect_locks {
+        w.set_definition_index(definition_to_index(meta.definition));
+    }
+    if !(respect_locks && w.get_lock_year()) {
+        let y = meta
+            .release_date
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        w.set_year_text(SharedString::from(y));
+    }
+    if !(respect_locks && w.get_lock_rating()) {
+        let r = meta.content_rating.clone().unwrap_or_default();
+        w.set_rating_index(rating_to_index(&r));
+    }
+    if !(respect_locks && w.get_lock_summary()) {
+        w.set_summary_text(SharedString::from(meta.summary.clone().unwrap_or_default()));
+    }
+    if !(respect_locks && w.get_lock_overview()) {
+        w.set_overview_text(SharedString::from(meta.overview.clone().unwrap_or_default()));
+    }
+    if !(respect_locks && w.get_lock_genres()) {
+        w.set_genres_text(SharedString::from(meta.genres.join(", ")));
+    }
+    if !(respect_locks && w.get_lock_cast()) {
+        w.set_cast_text(SharedString::from(join_people(&meta.cast)));
+    }
+    if !(respect_locks && w.get_lock_directors()) {
+        w.set_directors_text(SharedString::from(join_people(&meta.directors)));
+    }
+    if !(respect_locks && w.get_lock_producers()) {
+        w.set_producers_text(SharedString::from(join_people(&meta.producers)));
+    }
+    if !(respect_locks && w.get_lock_writers()) {
+        w.set_writers_text(SharedString::from(join_people(&meta.writers)));
+    }
+    if !(respect_locks && w.get_lock_studio()) {
+        w.set_studio_text(SharedString::from(meta.studio.clone().unwrap_or_default()));
+    }
+
+    // Rebuild the poster grid model (all placeholders; thumbs fetched below).
+    let n = meta.artwork.len();
+    {
+        let c = ctrl.borrow();
+        c.posters.set_vec(
+            (0..n)
+                .map(|_| PosterItem {
+                    image: slint::Image::default(),
+                    loaded: false,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    ctrl.borrow_mut().thumb_requested = vec![false; n];
+    {
+        let mut c = ctrl.borrow_mut();
+        c.full_images = vec![None; n];
+        c.full_requested = vec![false; n];
+        c.lightbox = None;
+    }
+    w.set_show_lightbox(false);
+
+    // Eagerly request thumbnails for every candidate (result sets are small).
+    {
+        let c = ctrl.borrow();
+        for (i, art) in meta.artwork.iter().enumerate() {
+            let thumb_url = art.thumb_url.clone().unwrap_or_else(|| art.url.clone());
+            let _ = c.worker.tx.send(Request::FetchThumb {
+                index: i,
+                url: thumb_url,
+            });
+        }
+    }
+    ctrl.borrow_mut().thumb_requested = vec![true; n];
+
+    ctrl.borrow_mut().meta = Some(meta);
+    refresh_committed(ctrl, w);
+    update_undo_redo(ctrl, w);
+}
+
+/// Rebuild a MediaMetadata from the edited properties before writing.
+fn collect_edited(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) -> Option<MediaMetadata> {
+    use tagtiger_core::model::Person;
+    let base = ctrl.borrow().meta.clone()?;
+    let mut m = base;
+    m.title = w.get_title_text().to_string();
+    m.video_kind = index_to_video_kind(w.get_video_kind_index());
+    m.definition = index_to_definition(w.get_definition_index());
+    m.release_date =
+        chrono::NaiveDate::parse_from_str(w.get_year_text().trim(), "%Y-%m-%d").ok();
+    let rating = index_to_rating(w.get_rating_index());
+    m.content_rating = if rating.trim().is_empty() {
+        None
+    } else {
+        Some(rating)
+    };
+    let summary = w.get_summary_text().to_string();
+    m.summary = if summary.trim().is_empty() {
+        None
+    } else {
+        Some(summary.chars().take(255).collect())
+    };
+    let overview = w.get_overview_text().to_string();
+    m.overview = if overview.trim().is_empty() {
+        None
+    } else {
+        Some(overview)
+    };
+    m.genres = split_csv(&w.get_genres_text());
+    m.cast = split_csv(&w.get_cast_text())
+        .into_iter()
+        .map(Person::new)
+        .collect();
+    m.directors = split_csv(&w.get_directors_text())
+        .into_iter()
+        .map(Person::new)
+        .collect();
+    m.producers = split_csv(&w.get_producers_text())
+        .into_iter()
+        .map(Person::new)
+        .collect();
+    m.writers = split_csv(&w.get_writers_text())
+        .into_iter()
+        .map(Person::new)
+        .collect();
+    let studio = w.get_studio_text().to_string();
+    m.studio = if studio.trim().is_empty() {
+        None
+    } else {
+        Some(studio.trim().to_string())
+    };
+    Some(m)
+}
+
+// ---------------------------------------------------------------------------
+// Dialogs (License / Settings) + lightbox + CLI install + icon
+// ---------------------------------------------------------------------------
+
+/// Open the License Key dialog, prefilling saved values.
+fn open_license_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let (email, key) = {
+        let c = ctrl.borrow();
+        (
+            c.settings.license_email.clone(),
+            crate::license_mgr::format_key(&c.settings.license_key),
+        )
+    };
+    let valid = crate::license_mgr::is_valid(&key, &email);
+    w.set_license_email(SharedString::from(email));
+    w.set_license_key(SharedString::from(key));
+    w.set_license_valid(valid);
+    w.set_license_msg(SharedString::from(""));
+    w.set_show_license(true);
+}
+
+/// Save the license entered in the dialog (validated live in the UI).
+fn license_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let email = w.get_license_email().trim().to_string();
+    let key = crate::license_mgr::normalize_key(&w.get_license_key());
+    let result = {
+        let mut c = ctrl.borrow_mut();
+        c.settings.license_email = email;
+        c.settings.license_key = key;
+        c.settings.save()
+    };
+    match result {
+        Ok(()) => {
+            w.set_show_license(false);
+            w.set_status(SharedString::from("License saved. Thank you!"));
+            // A valid license suppresses the splash and updates About.
+            let licensed = ctrl.borrow().settings.is_licensed();
+            w.set_about_licensed(licensed);
+            if licensed {
+                w.set_show_splash(false);
+            }
+        }
+        Err(e) => {
+            w.set_license_msg(SharedString::from(format!("Couldn't save settings: {e}")));
+        }
+    }
+}
+
+/// Open the Settings dialog, prefilling the saved TMDB Bearer token.
+fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let token = ctrl.borrow().settings.tmdb_bearer_token.clone();
+    w.set_settings_token(SharedString::from(token));
+    w.set_show_settings(true);
+}
+
+/// Save the TMDB token from the Settings dialog and hand it to the worker.
+fn settings_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let token = w.get_settings_token().trim().to_string();
+    let result = {
+        let mut c = ctrl.borrow_mut();
+        c.settings.tmdb_bearer_token = token.clone();
+        c.settings.save()
+    };
+    match result {
+        Ok(()) => w.set_status(SharedString::from("TMDB token saved.")),
+        Err(e) => w.set_status(SharedString::from(format!("Failed to save settings: {e}"))),
+    }
+    // Empty clears it, falling back to environment variables.
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::SetBearerToken(token));
+    w.set_show_settings(false);
+}
+
+/// Open the lightbox on the current file cover (already-decoded image).
+fn open_current_cover_lightbox(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    if !w.get_has_cover() {
+        return;
+    }
+    ctrl.borrow_mut().lightbox = Some(Lightbox::CurrentCover);
+    // Reuse the cover image already set on the window.
+    w.set_lightbox_image(w.get_cover_image());
+    w.set_lightbox_loaded(true);
+    w.set_show_lightbox(true);
+}
+
+/// Open the lightbox for a TMDB artwork `index`, requesting a larger image if
+/// not already loaded.
+fn open_tmdb_lightbox(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
+    if idx < 0 {
+        return;
+    }
+    let index = idx as usize;
+    let (cached, url, needs_fetch) = {
+        let c = ctrl.borrow();
+        let cached = c.full_images.get(index).and_then(|s| s.clone());
+        let url = c
+            .meta
+            .as_ref()
+            .and_then(|m| m.artwork.get(index))
+            .map(|a| a.url.clone());
+        let needs_fetch = cached.is_none()
+            && !c.full_requested.get(index).copied().unwrap_or(true);
+        (cached, url, needs_fetch)
+    };
+    ctrl.borrow_mut().lightbox = Some(Lightbox::Tmdb(index));
+    match cached {
+        Some(img) => {
+            w.set_lightbox_image(img);
+            w.set_lightbox_loaded(true);
+        }
+        None => {
+            w.set_lightbox_loaded(false);
+        }
+    }
+    w.set_show_lightbox(true);
+    if needs_fetch {
+        if let Some(url) = url {
+            if let Some(flag) = ctrl.borrow_mut().full_requested.get_mut(index) {
+                *flag = true;
+            }
+            let c = ctrl.borrow();
+            let _ = c.worker.tx.send(Request::FetchFullImage { index, url });
+        }
+    }
+}
+
+/// macOS: resolve the window's `NSView` via its raw window handle and install
+/// the native file drag-and-drop overlay (see `macos_open::install_drag_drop`).
+#[cfg(target_os = "macos")]
+fn install_native_drag_drop(w: &MainWindow) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let win = w.window();
+    let sh = win.window_handle();
+    let wh = match sh.window_handle() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if let RawWindowHandle::AppKit(appkit) = wh.as_raw() {
+        // SAFETY: the handle is valid for the live window; called on the UI
+        // (main) thread from a Slint event-loop timer.
+        unsafe {
+            crate::macos_open::install_drag_drop(appkit.ns_view.as_ptr());
+        }
+    }
+}
+
+/// Decode the embedded 256px PNG icon into a `slint::Image` for dialogs and the
+/// window icon.
+fn load_app_icon() -> Option<slint::Image> {
+    let bytes = include_bytes!("resources/app_icon_256.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(rgba_to_image(w, h, &img.into_raw()))
+}
+
+/// Open a URL in the user's default browser.
+fn webbrowser_open(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+    }
+}
+
+/// Install the `tagtiger` CLI onto the user's PATH.
+#[cfg(target_os = "macos")]
+fn install_cli(_ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    use std::path::PathBuf;
+
+    let cli = match std::env::current_exe() {
+        Ok(exe) => exe
+            .parent()
+            .map(|dir| dir.join("tagtiger-cli"))
+            .unwrap_or_else(|| PathBuf::from("tagtiger-cli")),
+        Err(e) => {
+            w.set_status(SharedString::from(format!(
+                "Couldn't locate the app executable: {e}"
+            )));
+            return;
+        }
+    };
+    if !cli.exists() {
+        w.set_status(SharedString::from(
+            "Couldn't find the bundled CLI (tagtiger-cli) next to the app.",
+        ));
+        return;
+    }
+
+    let dest = "/usr/local/bin/tagtiger";
+    let src = cli.to_string_lossy().to_string();
+
+    let bindir = std::path::Path::new("/usr/local/bin");
+    let writable_no_sudo = bindir.exists()
+        && std::fs::metadata(bindir)
+            .map(|m| {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o200 != 0
+            })
+            .unwrap_or(false)
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(bindir.join(".tagtiger-write-probe"))
+            .map(|_| {
+                let _ = std::fs::remove_file(bindir.join(".tagtiger-write-probe"));
+                true
+            })
+            .unwrap_or(false);
+
+    if writable_no_sudo {
+        let _ = std::fs::remove_file(dest);
+        match std::os::unix::fs::symlink(&src, dest) {
+            Ok(()) => {
+                w.set_status(SharedString::from(format!(
+                    "Installed CLI: run `tagtiger --help`. ({dest})"
+                )));
+            }
+            Err(e) => w.set_status(SharedString::from(format!("Failed to install CLI: {e}"))),
+        }
+        return;
+    }
+
+    // Privileged path: prompt for admin rights via osascript.
+    let esc = |s: &str| s.replace('\'', r"'\''");
+    let shell_cmd = format!(
+        "mkdir -p /usr/local/bin && ln -sf '{}' '{}'",
+        esc(&src),
+        esc(dest)
+    );
+    let as_literal = shell_cmd.replace('\\', r"\\").replace('"', r#"\""#);
+    let script = format!("do shell script \"{as_literal}\" with administrator privileges");
+
+    match std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            w.set_status(SharedString::from(format!(
+                "Installed CLI: run `tagtiger --help`. ({dest})"
+            )));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("User canceled") || err.contains("(-128)") {
+                w.set_status(SharedString::from("CLI install cancelled."));
+            } else {
+                w.set_status(SharedString::from(format!(
+                    "Failed to install CLI: {}",
+                    err.trim()
+                )));
+            }
+        }
+        Err(e) => w.set_status(SharedString::from(format!("Failed to run installer: {e}"))),
+    }
+}
+
+/// CLI install is a macOS-only feature; a no-op elsewhere.
+#[cfg(not(target_os = "macos"))]
+fn install_cli(_ctrl: &Rc<RefCell<Controller>>, _w: &MainWindow) {}
+
+// ---------------------------------------------------------------------------
+// Search / write
+// ---------------------------------------------------------------------------
+
+fn start_search(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let query = w.get_search_query().trim().to_string();
+    if query.is_empty() {
+        w.set_status(SharedString::from("Enter a title to search."));
+        return;
+    }
+    if !has_tmdb_credential(ctrl) {
+        w.set_show_no_credential(true);
+        return;
+    }
+    w.set_status(SharedString::from(format!("Searching for “{query}”…")));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::Search { query });
+}
+
+/// Whether a TMDB credential is available: a saved Bearer token or one of the
+/// `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables.
+fn has_tmdb_credential(ctrl: &Rc<RefCell<Controller>>) -> bool {
+    if !ctrl.borrow().settings.tmdb_bearer_token.trim().is_empty() {
+        return true;
+    }
+    let env_set = |k: &str| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    env_set("TMDB_BEARER_TOKEN") || env_set("TMDB_API_KEY")
+}
+
+fn write_tags(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    if ctrl.borrow().writing {
+        return;
+    }
+    let file = ctrl.borrow().file.clone();
+    let meta = collect_edited(ctrl, w);
+    let (Some(file), Some(meta)) = (file, meta) else {
+        w.set_status(SharedString::from("Nothing to write."));
+        return;
+    };
+    let (cover_override, fast_start) = {
+        let c = ctrl.borrow();
+        (c.cover_bytes.clone(), c.edit_fast_start)
+    };
+    ctrl.borrow_mut().writing = true;
+    w.set_writing(true);
+    w.set_status(SharedString::from("Writing…"));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::WriteTags {
+        file,
+        meta: Box::new(meta),
+        artwork_url: None,
+        cover_override,
+        fast_start,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Enum <-> combo index mapping
+// ---------------------------------------------------------------------------
+
+/// video-kind combo: index 0 = "(none)"; index i>0 -> VideoKind::all()[i-1].
+fn index_to_video_kind(i: i32) -> Option<VideoKind> {
+    if i <= 0 {
+        None
+    } else {
+        VideoKind::all().get((i - 1) as usize).copied()
+    }
+}
+fn video_kind_to_index(k: Option<VideoKind>) -> i32 {
+    match k {
+        None => 0,
+        Some(k) => VideoKind::all()
+            .iter()
+            .position(|x| *x == k)
+            .map(|p| (p + 1) as i32)
+            .unwrap_or(0),
+    }
+}
+
+fn index_to_definition(i: i32) -> Option<Definition> {
+    if i <= 0 {
+        None
+    } else {
+        Definition::all().get((i - 1) as usize).copied()
+    }
+}
+fn definition_to_index(d: Option<Definition>) -> i32 {
+    match d {
+        None => 0,
+        Some(d) => Definition::all()
+            .iter()
+            .position(|x| *x == d)
+            .map(|p| (p + 1) as i32)
+            .unwrap_or(0),
+    }
+}
+
+/// rating combo options: index 0 = "(none)", then MOVIE_RATINGS, then
+/// TV_RATINGS — matching ui/app.slint's rating-options.
+fn rating_options() -> Vec<&'static str> {
+    let mut v = vec!["(none)"];
+    v.extend_from_slice(MOVIE_RATINGS);
+    v.extend_from_slice(TV_RATINGS);
+    v
+}
+fn index_to_rating(i: i32) -> String {
+    if i <= 0 {
+        String::new()
+    } else {
+        rating_options()
+            .get(i as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+}
+fn rating_to_index(r: &str) -> i32 {
+    if r.trim().is_empty() {
+        return 0;
+    }
+    rating_options()
+        .iter()
+        .position(|s| *s == r)
+        .map(|p| p as i32)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Image + formatting helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `slint::Image` from an RGBA8 buffer.
+fn rgba_to_image(width: u32, height: u32, rgba: &[u8]) -> slint::Image {
+    let mut buf = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+    buf.make_mut_bytes().copy_from_slice(rgba);
+    slint::Image::from_rgba8(buf)
+}
+
+fn join_people(people: &[tagtiger_core::model::Person]) -> String {
+    people
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn dims_caption(size: Option<(u32, u32)>) -> String {
+    match size {
+        Some((w, h)) if w > 0 && h > 0 => format!("{w} x {h}"),
+        _ => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers (no UI dependency) — reused from the egui implementation.
+// ---------------------------------------------------------------------------
+
+/// US movie (MPAA) content ratings.
+const MOVIE_RATINGS: &[&str] = &["G", "PG", "PG-13", "R", "NC-17", "Not Rated", "Unrated"];
+/// US TV content ratings.
+const TV_RATINGS: &[&str] = &["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
+
+/// Split a comma-separated list into trimmed, non-empty entries.
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
         .map(|x| x.trim().to_string())
@@ -813,13 +1740,11 @@ fn is_movie_path(path: &std::path::Path) -> bool {
     matches!(ext_lower(path).as_deref(), Some("mp4") | Some("m4v"))
 }
 
-/// Convert a launch argument — a plain path or a `file://` URI (as delivered
-/// by the Linux `.desktop` `%U` field) — into a movie path that exists on disk.
-/// Returns `None` if it isn't a real, taggable movie file.
+/// Convert a launch argument — a plain path or a `file://` URI — into a movie
+/// path that exists on disk. Returns `None` if it isn't a real movie file.
 fn arg_to_movie_path(arg: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     let s = arg.to_string_lossy();
     let path = if let Some(rest) = s.strip_prefix("file://") {
-        // Drop an optional authority (e.g. localhost) before the first '/'.
         let rest = match rest.find('/') {
             Some(i) => &rest[i..],
             None => rest,
@@ -831,8 +1756,7 @@ fn arg_to_movie_path(arg: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     (is_movie_path(&path) && path.exists()).then_some(path)
 }
 
-/// Minimal percent-decoding for `file://` URIs (e.g. `%20` -> space). Invalid
-/// escapes are left as-is. Avoids pulling in a URL-parsing dependency.
+/// Minimal percent-decoding for `file://` URIs (e.g. `%20` -> space).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -854,6 +1778,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Whether a path looks like an image file (for poster replacement).
+#[allow(dead_code)]
 fn is_image_path(path: &std::path::Path) -> bool {
     matches!(
         ext_lower(path).as_deref(),
@@ -861,13 +1786,7 @@ fn is_image_path(path: &std::path::Path) -> bool {
     )
 }
 
-/// US movie (MPAA) content ratings, shown at the top of the Rating menu.
-const MOVIE_RATINGS: &[&str] = &["G", "PG", "PG-13", "R", "NC-17", "Not Rated", "Unrated"];
-/// US TV content ratings, shown at the bottom of the Rating menu.
-const TV_RATINGS: &[&str] = &["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-
-/// Format an image size caption like "1000 x 1500", or a placeholder when the
-/// dimensions are unknown.
+/// Format an image size caption like "1000 x 1500", or a placeholder.
 fn size_caption(size: Option<(u32, u32)>) -> String {
     match size {
         Some((w, h)) if w > 0 && h > 0 => format!("{w} x {h}"),
@@ -875,1644 +1794,13 @@ fn size_caption(size: Option<(u32, u32)>) -> String {
     }
 }
 
-/// Render a right-aligned label occupying a fixed-width cell, so all field
-/// labels line up on their right edge next to the inputs.
-fn right_label(ui: &mut egui::Ui, text: &str, width: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 20.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.label(text);
-        },
-    );
-}
-
-/// Render one field row (no grid, so the input can fill available width):
-/// fixed-width label | input that fills the remaining space | lock checkbox.
-/// When `lock` is set, the input is non-interactive (read-only). Returns the
-/// text input's `Response` for focus/edit tracking.
-fn field_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut String,
-    lock: &mut bool,
-    label_w: f32,
-) -> egui::Response {
-    // Space reserved on the right for the "Lock" checkbox + spacing.
-    const LOCK_W: f32 = 64.0;
-    ui.horizontal(|ui| {
-        right_label(ui, label, label_w);
-        let input_w = (ui.available_width() - LOCK_W).max(120.0);
-        let resp = ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(input_w)
-                .interactive(!*lock),
-        );
-        ui.checkbox(lock, "Lock");
-        resp
-    })
-    .inner
-}
-
-/// Render a "people" row (Cast/Directors/Producers/Screenwriters): a right
-/// label, a multiline input that wraps and grows vertically as needed, and a
-/// lock checkbox. Returns the input `Response` for focus/edit tracking.
-fn people_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut String,
-    lock: &mut bool,
-    label_w: f32,
-) -> egui::Response {
-    const LOCK_W: f32 = 64.0;
-    ui.horizontal(|ui| {
-        right_label(ui, label, label_w);
-        let input_w = (ui.available_width() - LOCK_W).max(120.0);
-        // `desired_rows(1)` with multiline: starts one line tall and grows as
-        // text wraps to more lines.
-        let resp = ui.add(
-            egui::TextEdit::multiline(value)
-                .desired_width(input_w)
-                .desired_rows(1)
-                .interactive(!*lock),
-        );
-        ui.checkbox(lock, "Lock");
-        resp
-    })
-    .inner
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.drain_events(&ctx);
-
-        // Focus for menu routing: the live focus this frame, or the focus from
-        // the previous frame as a fallback (opening a menu clears live focus,
-        // so the just-focused field is remembered for one frame).
-        let live_focus = ctx.memory(|m| m.focused());
-        let menu_focus = live_focus.or(self.last_text_focus);
-        // Remember this frame's live focus for next frame's fallback.
-        self.last_text_focus = live_focus;
-
-        // Busy cursor while details are loading.
-        if self.loading_details {
-            ctx.set_cursor_icon(egui::CursorIcon::Wait);
-        }
-
-        // macOS: pick up any files delivered via the "Open Documents" Apple
-        // Event (Finder "Open With", dock drops, double-click) that winit does
-        // not surface as dropped_files.
-        #[cfg(target_os = "macos")]
-        for path in crate::macos_open::take_pending() {
-            if is_movie_path(&path) && path.exists() {
-                let _ = self.worker.tx.send(Request::OpenFile { path });
-                self.status = "Opening file…".into();
-            }
-        }
-
-        // Handle a pasted image (Cmd/Ctrl+V) or a dropped image file: either
-        // replaces the current poster.
-        self.handle_image_input(&ctx);
-
-        // Global keyboard shortcuts for edit actions.
-        let (do_undo, do_redo, do_cut, do_copy, do_delete) = ctx.input(|i| {
-            let cmd = i.modifiers.command || i.modifiers.ctrl;
-            let shift = i.modifiers.shift;
-            (
-                cmd && !shift && i.key_pressed(egui::Key::Z),
-                cmd && ((shift && i.key_pressed(egui::Key::Z)) || i.key_pressed(egui::Key::Y)),
-                cmd && i.key_pressed(egui::Key::X),
-                cmd && i.key_pressed(egui::Key::C),
-                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
-            )
-        });
-        if do_undo {
-            self.undo(&ctx);
-        }
-        if do_redo {
-            self.redo(&ctx);
-        }
-        // Cut/Copy act on the poster only when it's the selected element.
-        if do_cut && self.poster_selected {
-            self.cut_poster(&ctx);
-        }
-        if do_copy && self.poster_selected {
-            self.copy_poster();
-        }
-        // Delete/Backspace removes the poster when it's the selected element
-        // and no text field has focus (so it won't disrupt text editing).
-        if do_delete && self.poster_selected && live_focus.is_none() {
-            self.delete_poster(&ctx);
-        }
-
-        egui::Panel::top("menubar").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open…").clicked() {
-                        self.status = "Choose a file…".into();
-                        let _ = self.worker.tx.send(Request::PickFile);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Settings…").clicked() {
-                        self.open_settings_dialog();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Edit", |ui| {
-                    let can_undo = !self.undo_stack.is_empty() || self.text_edit_pending.is_some();
-                    let can_redo = !self.redo_stack.is_empty();
-                    let has_poster = self.cover_bytes.is_some();
-
-                    if ui
-                        .add_enabled(can_undo, egui::Button::new("Undo"))
-                        .clicked()
-                    {
-                        self.undo(&ctx);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(can_redo, egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        self.redo(&ctx);
-                        ui.close();
-                    }
-                    ui.separator();
-                    let text_focused = menu_focus.is_some();
-                    let cut_copy_enabled =
-                        text_focused || (self.poster_selected && has_poster && !self.lock_poster);
-                    let copy_enabled = text_focused || (self.poster_selected && has_poster);
-                    let paste_enabled = text_focused || (self.file_loaded && !self.lock_poster);
-
-                    if ui
-                        .add_enabled(cut_copy_enabled, egui::Button::new("Cut"))
-                        .clicked()
-                    {
-                        self.menu_cut(&ctx, menu_focus);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(copy_enabled, egui::Button::new("Copy"))
-                        .clicked()
-                    {
-                        self.menu_copy(&ctx, menu_focus);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(paste_enabled, egui::Button::new("Paste"))
-                        .clicked()
-                    {
-                        self.menu_paste(&ctx, menu_focus);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("License Key…").clicked() {
-                        self.open_license_dialog();
-                        ui.close();
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        ui.separator();
-                        if ui.button("Install Command-Line Tool…").clicked() {
-                            self.install_cli();
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("About TagTiger").clicked() {
-                        self.about_open = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
-
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open file…").clicked() {
-                    self.status = "Choose a file…".into();
-                    let _ = self.worker.tx.send(Request::PickFile);
-                }
-                ui.separator();
-                ui.label(&self.status);
-            });
-        });
-
-        // Matches panel on the far right.
-        egui::Panel::right("results")
-            .default_size(300.0)
-            .show(ui, |ui| {
-                ui.heading("Matches");
-                if self.results.is_empty() {
-                    ui.label("No matches yet. Type a title and press search.");
-                }
-                let file = self.file.clone();
-                let locked = self.loading_details;
-                if locked {
-                    ui.label("Loading details…");
-                }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for r in &self.results {
-                        let label = format!(
-                            "{} ({})",
-                            r.title,
-                            r.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into())
-                        );
-                        // Disabled while a selection is loading, so the user
-                        // can't pick another match until data has loaded.
-                        let clicked = ui.add_enabled(!locked, egui::Button::new(label)).clicked();
-                        if clicked {
-                            if let Some(f) = &file {
-                                self.loading_details = true;
-                                self.status = "Loading details…".into();
-                                let _ = self.worker.tx.send(Request::FetchDetails {
-                                    id: ProviderId {
-                                        provider: r.id.provider.clone(),
-                                        id: r.id.id.clone(),
-                                        kind: r.id.kind,
-                                    },
-                                    file: f.clone(),
-                                });
-                            }
-                        }
-                    }
-                });
-            });
-
-        // Fields + posters on the left (central area).
-        egui::CentralPanel::default().show(ui, |ui| {
-            if !self.file_loaded {
-                ui.label("Open a file to begin.");
-                return;
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Search row: label, input, magnifying-glass button.
-                ui.horizontal(|ui| {
-                    ui.label("Search:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .desired_width(240.0)
-                            .hint_text("Movie title"),
-                    );
-                    if resp.gained_focus() {
-                        self.poster_selected = false;
-                    }
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    // Magnifying-glass button.
-                    if ui
-                        .button("\u{1F50D}")
-                        .on_hover_text("Search TMDB")
-                        .clicked()
-                        || enter
-                    {
-                        self.start_search();
-                    }
-                });
-
-                ui.separator();
-
-                // Two explicit columns inside the scroll area: a fields column
-                // on the left and a fixed-width poster column pinned right.
-                const POSTER_COL_W: f32 = 170.0;
-                const LABEL_W: f32 = 190.0;
-                let total_w = ui.available_width();
-                let fields_w = (total_w - POSTER_COL_W).max(320.0);
-                // Accumulate text-field focus/change to drive coalesced undo.
-                let mut f_gained = false;
-                let mut f_lost = false;
-                let mut f_changed = false;
-                // Snapshot taken before this frame's field edits are applied,
-                // so a coalesced text edit can be undone back to this state.
-                let pre_edit = self.snapshot();
-                ui.horizontal_top(|ui| {
-                    // Left: fields column (bounded width). No Grid — each row is
-                    // a horizontal with a filling input so it uses all width.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(fields_w, 0.0),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.heading("Fields");
-                            let r = field_row(
-                                ui,
-                                "Title",
-                                &mut self.edit_title,
-                                &mut self.lock_title,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            // Video Kind: popup of legal video types.
-                            ui.horizontal(|ui| {
-                                right_label(ui, "Video Kind", LABEL_W);
-                                ui.add_enabled_ui(!self.lock_video_kind, |ui| {
-                                    let current = self
-                                        .edit_video_kind
-                                        .map(|k| k.label())
-                                        .unwrap_or("(none)");
-                                    egui::ComboBox::from_id_salt("video_kind")
-                                        .selected_text(current)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    self.edit_video_kind.is_none(),
-                                                    "(none)",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.edit_video_kind = None;
-                                            }
-                                            for k in VideoKind::all() {
-                                                if ui
-                                                    .selectable_label(
-                                                        self.edit_video_kind == Some(*k),
-                                                        k.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.edit_video_kind = Some(*k);
-                                                }
-                                            }
-                                        });
-                                });
-                                ui.checkbox(&mut self.lock_video_kind, "Lock");
-                                ui.checkbox(&mut self.edit_fast_start, "Fast-start")
-                                    .on_hover_text(
-                                        "When checked, save a web-optimized file with moov \
-                                         before mdat. When unchecked, moov is placed after \
-                                         mdat.",
-                                    );
-                            });
-                            // Definition: SD / HD 720p / HD 1080p / 4K. Always
-                            // editable — selecting a TMDB match never changes it,
-                            // so there is no lock checkbox for this field.
-                            ui.horizontal(|ui| {
-                                right_label(ui, "Definition", LABEL_W);
-                                let current = self
-                                    .edit_definition
-                                    .map(|d| d.label())
-                                    .unwrap_or("(none)");
-                                egui::ComboBox::from_id_salt("definition")
-                                    .selected_text(current)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.edit_definition.is_none(),
-                                                "(none)",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.edit_definition = None;
-                                        }
-                                        for d in Definition::all() {
-                                            if ui
-                                                .selectable_label(
-                                                    self.edit_definition == Some(*d),
-                                                    d.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.edit_definition = Some(*d);
-                                            }
-                                        }
-                                    });
-                                if let Some((w, h)) = self.video_dimensions {
-                                    ui.label(format!("{w} x {h}"));
-                                }
-                            });
-                            let r = field_row(
-                                ui,
-                                "Release date (YYYY-MM-DD)",
-                                &mut self.edit_year,
-                                &mut self.lock_year,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            // Rating: label | dropdown | lock. Movie ratings on
-                            // top, TV ratings below a separator.
-                            ui.horizontal(|ui| {
-                                right_label(ui, "Rating", LABEL_W);
-                                ui.add_enabled_ui(!self.lock_rating, |ui| {
-                                    let combo = egui::ComboBox::from_id_salt("rating")
-                                        .selected_text(if self.edit_rating.is_empty() {
-                                            "(none)".to_string()
-                                        } else {
-                                            self.edit_rating.clone()
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            let mut changed = false;
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut self.edit_rating,
-                                                    String::new(),
-                                                    "(none)",
-                                                )
-                                                .changed();
-                                            ui.label("Movie");
-                                            for r in MOVIE_RATINGS {
-                                                changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.edit_rating,
-                                                        (*r).to_string(),
-                                                        *r,
-                                                    )
-                                                    .changed();
-                                            }
-                                            ui.separator();
-                                            ui.label("TV");
-                                            for r in TV_RATINGS {
-                                                changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.edit_rating,
-                                                        (*r).to_string(),
-                                                        *r,
-                                                    )
-                                                    .changed();
-                                            }
-                                            changed
-                                        });
-                                    if combo.inner == Some(true) {
-                                        f_changed = true;
-                                        f_lost = true;
-                                    }
-                                });
-                                ui.checkbox(&mut self.lock_rating, "Lock");
-                            });
-                            let r = field_row(
-                                ui,
-                                "Genres (comma-sep)",
-                                &mut self.edit_genres,
-                                &mut self.lock_genres,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            let r = people_row(
-                                ui,
-                                "Directors (comma-sep)",
-                                &mut self.edit_directors,
-                                &mut self.lock_directors,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            let r = people_row(
-                                ui,
-                                "Cast (comma-sep)",
-                                &mut self.edit_cast,
-                                &mut self.lock_cast,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            let r = people_row(
-                                ui,
-                                "Producers (comma-sep)",
-                                &mut self.edit_producers,
-                                &mut self.lock_producers,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            let r = people_row(
-                                ui,
-                                "Screenwriters (comma-sep)",
-                                &mut self.edit_writers,
-                                &mut self.lock_writers,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-                            let r = field_row(
-                                ui,
-                                "Studio",
-                                &mut self.edit_studio,
-                                &mut self.lock_studio,
-                                LABEL_W,
-                            );
-                            f_gained |= r.gained_focus();
-                            f_lost |= r.lost_focus();
-                            f_changed |= r.changed();
-
-                            // Summary: 2-line input, 255-character limit.
-                            ui.horizontal(|ui| {
-                                right_label(
-                                    ui,
-                                    &format!(
-                                        "Summary ({}/255)",
-                                        self.edit_summary.chars().count()
-                                    ),
-                                    LABEL_W,
-                                );
-                                let input_w = (ui.available_width() - 64.0).max(120.0);
-                                let resp = ui.add(
-                                    egui::TextEdit::multiline(&mut self.edit_summary)
-                                        .desired_width(input_w)
-                                        .desired_rows(2)
-                                        .interactive(!self.lock_summary),
-                                );
-                                if resp.changed() && self.edit_summary.chars().count() > 255 {
-                                    // Enforce the 255-character limit as the
-                                    // user types.
-                                    self.edit_summary =
-                                        self.edit_summary.chars().take(255).collect();
-                                }
-                                f_gained |= resp.gained_focus();
-                                f_lost |= resp.lost_focus();
-                                f_changed |= resp.changed();
-                                ui.checkbox(&mut self.lock_summary, "Lock");
-                            });
-
-                            // Long Description: multiline input, then lock.
-                            ui.horizontal(|ui| {
-                                right_label(ui, "Long Description", LABEL_W);
-                                let input_w = (ui.available_width() - 64.0).max(120.0);
-                                let resp = ui.add(
-                                    egui::TextEdit::multiline(&mut self.edit_overview)
-                                        .desired_width(input_w)
-                                        .desired_rows(4)
-                                        .interactive(!self.lock_overview),
-                                );
-                                f_gained |= resp.gained_focus();
-                                f_lost |= resp.lost_focus();
-                                f_changed |= resp.changed();
-                                ui.checkbox(&mut self.lock_overview, "Lock");
-                            });
-                        },
-                    );
-
-                    // Right: current poster pinned to the far right.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 0.0),
-                        egui::Layout::top_down(egui::Align::RIGHT),
-                        |ui| {
-                            // Fixed-width centered column so the caption and
-                            // lock line up under the poster.
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(150.0, 0.0),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    if let Some(tex) = &self.cover_thumb {
-                                        let resp = ui
-                                            .add(
-                                                egui::Image::new(tex)
-                                                    .max_width(150.0)
-                                                    .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text(
-                                                "Click to select · double-click to enlarge · paste/drop to replace",
-                                            );
-                                        if resp.double_clicked() {
-                                            self.lightbox = Some(Lightbox::CurrentCover);
-                                        } else if resp.clicked() {
-                                            // Toggle selection of the current
-                                            // poster (enables Cut/Copy).
-                                            self.poster_selected = !self.poster_selected;
-                                            self.selected_artwork = None;
-                                        }
-                                        // Highlight border when selected.
-                                        if self.poster_selected {
-                                            ui.painter().rect_stroke(
-                                                resp.rect.expand(3.0),
-                                                4.0,
-                                                egui::Stroke::new(
-                                                    3.0,
-                                                    egui::Color32::LIGHT_BLUE,
-                                                ),
-                                                egui::StrokeKind::Outside,
-                                            );
-                                        }
-                                    } else {
-                                        ui.add_sized(
-                                            [150.0, 210.0],
-                                            egui::Label::new("(no poster in file)\npaste/drop to add"),
-                                        );
-                                    }
-                                    // Actual size caption, centered under image.
-                                    ui.label(size_caption(self.cover_size));
-                                    ui.checkbox(&mut self.lock_poster, "Lock");
-                                },
-                            );
-                        },
-                    );
-                });
-
-                // Clicking/focusing a text field deselects the current poster.
-                if f_gained {
-                    self.poster_selected = false;
-                }
-
-                // Coalesced undo for text edits: capture the pre-edit snapshot
-                // when a field first gains focus or changes, and commit it as a
-                // single undo step when focus leaves the field.
-                if (f_gained || f_changed) && self.text_edit_pending.is_none() {
-                    self.text_edit_pending = Some(pre_edit);
-                }
-                if f_lost {
-                    self.commit_text_edit();
-                }
-
-                ui.separator();
-                if ui
-                    .add_enabled(!self.writing, egui::Button::new("Write tags"))
-                    .clicked()
-                {
-                    self.write_tags();
-                }
-
-                // Poster choices from TMDB at the bottom.
-                ui.separator();
-                ui.heading("Poster choices (TMDB)");
-                ui.label("Click to set as current poster · double-click to enlarge");
-                self.poster_grid(ui);
-            });
-        });
-
-        // Lightbox overlay (rendered last so it sits on top).
-        self.lightbox_window(&ctx);
-
-        // Progress overlay during a shift-save (streaming media to temp file).
-        if let Some((done, total)) = self.write_progress {
-            egui::Window::new("Saving")
-                .id(egui::Id::new("save_progress"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(&ctx, |ui| {
-                    ui.label("Rewriting file (moving media)…");
-                    let frac = if total > 0 {
-                        done as f32 / total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(320.0)
-                            .show_percentage(),
-                    );
-                    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
-                    if total > 0 {
-                        ui.label(format!("{:.0} / {:.0} MiB", mb(done), mb(total)));
-                    }
-                });
-        }
-
-        // Completion dialog after a save (in-place or rewrite).
-        if let Some(msg) = self.write_done_msg.clone() {
-            egui::Window::new("Update complete")
-                .id(egui::Id::new("save_complete"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(&ctx, |ui| {
-                    ui.label(msg);
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| {
-                        if ui.button("OK").clicked() {
-                            self.write_done_msg = None;
-                            // Now that the completion dialog is dismissed, show
-                            // the deferred donation splash (unlicensed, every
-                            // 5th write) so it's actually visible on top.
-                            if self.splash_pending {
-                                self.splash_pending = false;
-                                self.splash_shown_at = std::time::Instant::now();
-                                self.splash_until = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(20),
-                                );
-                            }
-                        }
-                    });
-                });
-        }
-
-        // About dialog (Help ▸ About) and the startup splash. Rendered last so
-        // they sit on top of everything else.
-        self.about_window(&ctx);
-        self.license_window(&ctx);
-        self.settings_window(&ctx);
-        self.no_credential_window(&ctx);
-        self.splash_window(&ctx);
-    }
-}
-
-impl App {
-    fn poster_grid(&mut self, ui: &mut egui::Ui) {
-        // Collect what we need up front to avoid borrowing `self.meta` while
-        // handling clicks that mutate `self`.
-        let Some(meta) = &self.meta else { return };
-        let count = meta.artwork.len();
-        if count == 0 {
-            ui.label("No artwork candidates.");
-            return;
-        }
-        // (full_url, thumb_url, size)
-        struct PosterInfo {
-            url: String,
-            thumb_url: String,
-            size: Option<(u32, u32)>,
-        }
-        let infos: Vec<PosterInfo> = meta
-            .artwork
-            .iter()
-            .map(|a| PosterInfo {
-                url: a.url.clone(),
-                thumb_url: a.thumb_url.clone().unwrap_or_else(|| a.url.clone()),
-                size: a.width.zip(a.height),
-            })
-            .collect();
-
-        // Actions to apply after rendering (deferred to satisfy the borrow
-        // checker): (set_cover_url, enlarge_index, select_index).
-        let mut set_cover: Option<String> = None;
-        let mut enlarge: Option<usize> = None;
-        let mut select: Option<usize> = None;
-        // Thumbnails whose cells are visible and not yet requested.
-        let mut to_fetch: Vec<(usize, String)> = Vec::new();
-
-        // Uniform cell size so the posters form a rectangular grid instead of
-        // stair-stepping on varying image heights.
-        const IMG_W: f32 = 140.0;
-        const IMG_H: f32 = 200.0;
-        const CAP_H: f32 = 18.0;
-        const CELL_PAD: f32 = 12.0;
-        let cell_w = IMG_W + CELL_PAD;
-        let cell_h = IMG_H + CAP_H + 6.0;
-
-        // Number of columns that fit the available width (at least one).
-        let avail = ui.available_width();
-        let cols = ((avail / cell_w).floor() as usize).max(1);
-
-        let mut i = 0usize;
-        while i < infos.len() {
-            ui.horizontal(|ui| {
-                for _ in 0..cols {
-                    if i >= infos.len() {
-                        break;
-                    }
-                    let info = &infos[i];
-                    // Each cell occupies a fixed-size box, so rows line up.
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::hover());
-
-                    // Lazy load: only fetch a thumbnail once its cell is visible
-                    // (scrolled into view) and hasn't been requested yet.
-                    let loaded = matches!(self.thumbs.get(i), Some(Some(_)));
-                    let requested = self.thumb_requested.get(i).copied().unwrap_or(true);
-                    if ui.is_rect_visible(rect) && !loaded && !requested {
-                        to_fetch.push((i, info.thumb_url.clone()));
-                    }
-
-                    let mut cell = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(rect)
-                            .layout(egui::Layout::top_down(egui::Align::Center)),
-                    );
-                    let response = if let Some(Some(tex)) = self.thumbs.get(i) {
-                        cell.add_sized(
-                            [IMG_W, IMG_H],
-                            egui::Image::new(tex)
-                                .max_size(egui::vec2(IMG_W, IMG_H))
-                                .sense(egui::Sense::click()),
-                        )
-                    } else {
-                        cell.add_sized([IMG_W, IMG_H], egui::Button::new("loading…"))
-                    };
-                    cell.label(size_caption(info.size));
-
-                    // Highlight rectangle around the selected grid poster.
-                    if self.selected_artwork == Some(i) {
-                        cell.painter().rect_stroke(
-                            response.rect.expand(3.0),
-                            4.0,
-                            egui::Stroke::new(3.0, egui::Color32::LIGHT_BLUE),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-
-                    if response.double_clicked() {
-                        enlarge = Some(i);
-                    } else if response.clicked() && !self.lock_poster {
-                        // Select (highlight) and set as the current poster.
-                        select = Some(i);
-                        set_cover = Some(info.url.clone());
-                    }
-                    i += 1;
-                }
-            });
-        }
-
-        // Kick off lazy thumbnail fetches for the cells that scrolled into view.
-        for (idx, thumb_url) in to_fetch {
-            if let Some(flag) = self.thumb_requested.get_mut(idx) {
-                *flag = true;
-            }
-            let _ = self.worker.tx.send(Request::FetchThumb {
-                index: idx,
-                url: thumb_url,
-            });
-        }
-
-        if let Some(idx) = select {
-            self.selected_artwork = Some(idx);
-            // Selecting a grid poster deselects the current-cover box.
-            self.poster_selected = false;
-        }
-        if let Some(i) = enlarge {
-            self.open_tmdb_lightbox(i);
-        }
-        if let Some(url) = set_cover {
-            self.status = "Setting poster…".into();
-            let _ = self.worker.tx.send(Request::SetCoverFromUrl { url });
-        }
-    }
-
-    /// Open the lightbox for a TMDB artwork `index`, requesting a larger image
-    /// if not already loaded.
-    fn open_tmdb_lightbox(&mut self, index: usize) {
-        self.lightbox = Some(Lightbox::Tmdb(index));
-        let needs_fetch = self
-            .full_images
-            .get(index)
-            .map(|slot| slot.is_none())
-            .unwrap_or(false);
-        if needs_fetch {
-            if let Some(meta) = &self.meta {
-                if let Some(art) = meta.artwork.get(index) {
-                    let _ = self.worker.tx.send(Request::FetchFullImage {
-                        index,
-                        url: art.url.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Render the enlarged lightbox viewer as a modal-style window.
-    fn lightbox_window(&mut self, ctx: &egui::Context) {
-        let Some(target) = self.lightbox else { return };
-
-        // Resolve the texture to show for the current target.
-        let tex: Option<egui::TextureHandle> = match target {
-            Lightbox::Tmdb(index) => self.full_images.get(index).and_then(|s| s.clone()),
-            Lightbox::CurrentCover => self.cover_full.clone(),
-        };
-
-        let mut open = true;
-        egui::Window::new("Poster preview")
-            .id(egui::Id::new("lightbox"))
-            .collapsible(false)
-            .resizable(true)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| match &tex {
-                Some(tex) => {
-                    ui.add(egui::Image::new(tex).max_height(760.0).max_width(760.0));
-                }
-                None => {
-                    ui.add_sized([360.0, 480.0], egui::Label::new("Loading…"));
-                }
-            });
-
-        // Close via the window's X button or Escape.
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.lightbox = None;
-        }
-    }
-
-    /// Detect a pasted (Cmd/Ctrl+V) or drag-and-dropped image and use it to
-    /// replace the current poster.
-    fn handle_image_input(&mut self, ctx: &egui::Context) {
-        // Drag-and-drop: route by file type. A movie (mp4/m4v) opens in the
-        // window; an image replaces the current poster.
-        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|f| f.path().to_path_buf())
-                .collect()
-        });
-        if !dropped.is_empty() {
-            // Prefer a movie file if one was dropped.
-            if let Some(movie) = dropped.iter().find(|p| is_movie_path(p)) {
-                let _ = self.worker.tx.send(Request::OpenFile {
-                    path: movie.clone(),
-                });
-                self.status = "Opening dropped file…".into();
-                return;
-            }
-            // Otherwise, treat the first image as a new poster.
-            if self.file_loaded && !self.lock_poster {
-                if let Some(img) = dropped.iter().find(|p| is_image_path(p)) {
-                    if let Ok(bytes) = std::fs::read(img) {
-                        self.set_cover_from_bytes_undoable(ctx, bytes);
-                        self.status = "Poster replaced from dropped image.".into();
-                    }
-                }
-            }
-            return;
-        }
-
-        // Clipboard paste via Cmd/Ctrl+V replaces the poster (image only).
-        if !self.file_loaded || self.lock_poster {
-            return;
-        }
-        let paste = ctx.input(|i| {
-            let cmd = i.modifiers.command || i.modifiers.ctrl;
-            cmd && i.key_pressed(egui::Key::V)
-        });
-        if paste {
-            if let Some(bytes) = read_clipboard_image_png() {
-                self.set_cover_from_bytes_undoable(ctx, bytes);
-                self.status = "Poster pasted.".into();
-            }
-        }
-    }
-
-    fn start_search(&mut self) {
-        let query = self.search_query.trim().to_string();
-        if query.is_empty() {
-            self.status = "Enter a title to search.".into();
-            return;
-        }
-        // TMDB searches need a credential. If neither a saved token nor an
-        // environment variable is configured, prompt the user to set one up
-        // rather than firing a request that would just error.
-        if !self.has_tmdb_credential() {
-            self.no_credential_open = true;
-            return;
-        }
-        self.status = format!("Searching for “{query}”…");
-        let _ = self.worker.tx.send(Request::Search { query });
-    }
-
-    /// Whether a TMDB credential is available: a saved Bearer token, or one of
-    /// the `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables. This
-    /// mirrors the worker's provider-construction logic.
-    fn has_tmdb_credential(&self) -> bool {
-        if !self.settings.tmdb_bearer_token.trim().is_empty() {
-            return true;
-        }
-        let env_set = |k: &str| {
-            std::env::var(k)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-        };
-        env_set("TMDB_BEARER_TOKEN") || env_set("TMDB_API_KEY")
-    }
-
-    fn write_tags(&mut self) {
-        // Guard against re-entry (e.g. Enter key) while a write is in flight.
-        if self.writing {
-            return;
-        }
-        let (Some(file), Some(meta)) = (self.file.clone(), self.collect_edited()) else {
-            self.status = "Nothing to write.".into();
-            return;
-        };
-        let cover_override = self.cover_bytes.clone();
-        // Mark as in-flight so the button is disabled until WriteDone/Error.
-        self.writing = true;
-        self.status = "Writing…".into();
-        let _ = self.worker.tx.send(Request::WriteTags {
-            file,
-            meta: Box::new(meta),
-            artwork_url: None,
-            cover_override,
-            fast_start: self.edit_fast_start,
-        });
-    }
-
-    /// Lazily create the 96×96 app-icon texture used by the About/Splash
-    /// dialogs, decoding the embedded PNG on first use.
-    fn ensure_icon(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if self.icon_tex.is_none() {
-            let bytes = include_bytes!("resources/app_icon_256.png");
-            if let Ok(img) = image::load_from_memory(bytes) {
-                let img = img.to_rgba8();
-                let (w, h) = img.dimensions();
-                let color =
-                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
-                self.icon_tex =
-                    Some(ctx.load_texture("app_icon", color, egui::TextureOptions::LINEAR));
-            }
-        }
-        self.icon_tex.clone()
-    }
-
-    /// The About dialog — a native rendering of TagTiger's `about.html`:
-    /// dark panel, rounded 96px icon, title, version/copyright/build lines,
-    /// links, and an OK button.
-    fn about_window(&mut self, ctx: &egui::Context) {
-        if !self.about_open {
-            return;
-        }
-        let icon = self.ensure_icon(ctx);
-        let mut open = true;
-        egui::Window::new("About TagTiger")
-            .id(egui::Id::new("about"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(8.0);
-                    if let Some(tex) = &icon {
-                        ui.add(
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(egui::vec2(96.0, 96.0))
-                                .corner_radius(20.0),
-                        );
-                    }
-                    ui.add_space(8.0);
-                    ui.label(title_text("TagTiger"));
-                    ui.add_space(6.0);
-                    ui.label(muted_text(&format!(
-                        "Version {}",
-                        env!("CARGO_PKG_VERSION")
-                    )));
-                    ui.label(muted_text("©2026 Richard Lesh"));
-                    ui.label(muted_text(&format!("Built with egui v{EGUI_VERSION}")));
-                    ui.add_space(2.0);
-                    ui.hyperlink_to("Glowing Cat Software", GLOWING_CAT_URL);
-                    ui.hyperlink_to("Report issues on GitHub", ISSUES_URL);
-                    ui.add_space(12.0);
-                    if ui.button("OK").clicked() {
-                        self.about_open = false;
-                    }
-                    // Donation thank-you shown only for licensed users.
-                    if self.settings.is_licensed() {
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("Thank you for donating to")
-                                .size(14.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)),
-                        );
-                        ui.label(
-                            egui::RichText::new("Glowing Cat Software!")
-                                .size(14.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)),
-                        );
-                    }
-                    ui.add_space(8.0);
-                });
-            });
-        // Close via the window's X button or Escape.
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.about_open = false;
-        }
-    }
-
-    /// The startup splash — a native rendering of TagTiger's `splash.html`:
-    /// dark panel, icon, title, version, and a donate message with a link.
-    /// Auto-closes after 20 seconds; also closes on a click anywhere except the
-    /// donate link.
-    fn splash_window(&mut self, ctx: &egui::Context) {
-        let Some(until) = self.splash_until else {
-            return;
-        };
-        // Auto-close after the timeout.
-        if std::time::Instant::now() >= until {
-            self.splash_until = None;
-            return;
-        }
-        // Keep repainting so the timeout fires even without user input.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-
-        let icon = self.ensure_icon(ctx);
-        let mut link_clicked = false;
-        egui::Window::new("TagTiger")
-            .id(egui::Id::new("splash"))
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(12.0);
-                    if let Some(tex) = &icon {
-                        ui.add(
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(egui::vec2(96.0, 96.0))
-                                .corner_radius(20.0),
-                        );
-                    }
-                    ui.add_space(8.0);
-                    ui.label(title_text("TagTiger"));
-                    ui.add_space(4.0);
-                    ui.label(muted_text(&format!(
-                        "Version {}",
-                        env!("CARGO_PKG_VERSION")
-                    )));
-                    ui.add_space(8.0);
-                    ui.label(body_text("If you enjoy using this product"));
-                    ui.label(body_text("please consider donating to help"));
-                    ui.label(body_text("fund this and other open source"));
-                    // Final line: "projects at <link>." — rendered as one line
-                    // with no inter-widget spacing, centered by measuring the
-                    // actual text width (the pieces are separate widgets because
-                    // only the middle one is a clickable link).
-                    let pre = "projects at ";
-                    let link = "Glowing Cat Software";
-                    let post = ".";
-                    let font = egui::FontId::proportional(14.0);
-                    let text_w = |s: &str| {
-                        ui.ctx().fonts_mut(|f| {
-                            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
-                                .size()
-                                .x
-                        })
-                    };
-                    let total_w = text_w(pre) + text_w(link) + text_w(post);
-                    ui.horizontal(|ui| {
-                        // Remove the default gaps between the three pieces so the
-                        // link sits flush against the surrounding text.
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let offset = ((ui.available_width() - total_w) / 2.0).max(0.0);
-                        ui.add_space(offset);
-                        ui.label(body_text(pre));
-                        if ui.link(egui::RichText::new(link).size(14.0)).clicked() {
-                            link_clicked = true;
-                            let _ = webbrowser_open(GLOWING_CAT_URL);
-                        }
-                        ui.label(body_text(post));
-                    });
-                    ui.add_space(12.0);
-                });
-            });
-
-        // Close on a click anywhere except the donate link — but ignore clicks
-        // during a short grace period after the splash is armed, so the very
-        // click that spawns it (e.g. OK on the completion dialog, or an
-        // in-progress drag) doesn't instantly dismiss it.
-        let grace = std::time::Duration::from_millis(400);
-        let past_grace = self.splash_shown_at.elapsed() >= grace;
-        let clicked_anywhere = ctx.input(|i| i.pointer.any_click());
-        if past_grace && clicked_anywhere && !link_clicked {
-            self.splash_until = None;
-        }
-    }
-
-    /// The License Key dialog — a native rendering of TagTiger's
-    /// `license_dialog.html`: email + key inputs with live validation, a donate
-    /// link, and Cancel/Save. Save is enabled only when the key is valid for
-    /// the entered email; saving persists the license to settings.
-    fn license_window(&mut self, ctx: &egui::Context) {
-        if !self.license_open {
-            return;
-        }
-        let mut open = true;
-        let mut do_save = false;
-        let mut do_cancel = false;
-
-        egui::Window::new("License Key")
-            .id(egui::Id::new("license"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(title_text("License Key"));
-                    ui.add_space(4.0);
-                    ui.label(muted_text("Enter your email address and license key"));
-                    ui.add_space(8.0);
-                });
-
-                // Email input.
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.license_email_input)
-                        .hint_text("Your email address")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-
-                // Key input: reformat to XXXX-XXXX-XXXX-XXXX as the user types.
-                let key_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.license_key_input)
-                        .hint_text("XXXX-XXXX-XXXX-XXXX")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY),
-                );
-                if key_resp.changed() {
-                    self.license_key_input =
-                        crate::license_mgr::format_key(&self.license_key_input);
-                }
-
-                let valid = crate::license_mgr::is_valid(
-                    &self.license_key_input,
-                    &self.license_email_input,
-                );
-
-                ui.add_space(8.0);
-                ui.hyperlink_to(
-                    "Donate at Glowing Cat Software to get a license key.",
-                    GLOWING_CAT_URL,
-                );
-                if !self.license_msg.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(muted_text(&self.license_msg));
-                }
-                ui.add_space(10.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
-                    if ui.add_enabled(valid, egui::Button::new("Save")).clicked() {
-                        do_save = true;
-                    }
-                });
-            });
-
-        // Enter saves (when valid); Escape cancels.
-        let (enter, escape) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
-        if enter && crate::license_mgr::is_valid(&self.license_key_input, &self.license_email_input)
-        {
-            do_save = true;
-        }
-        if escape {
-            do_cancel = true;
-        }
-
-        if do_save {
-            self.settings.license_email = self.license_email_input.trim().to_string();
-            self.settings.license_key = crate::license_mgr::normalize_key(&self.license_key_input);
-            match self.settings.save() {
-                Ok(()) => {
-                    self.status = "License saved. Thank you!".into();
-                    self.license_open = false;
-                    // A valid license suppresses the splash immediately.
-                    self.splash_until = None;
-                }
-                Err(e) => {
-                    self.license_msg = format!("Couldn't save settings: {e}");
-                }
-            }
-        }
-        if do_cancel || !open {
-            self.license_open = false;
-            self.license_msg.clear();
-        }
-    }
-
-    /// Open the License Key dialog, prefilling the currently saved values.
-    fn open_license_dialog(&mut self) {
-        self.license_email_input = self.settings.license_email.clone();
-        self.license_key_input = crate::license_mgr::format_key(&self.settings.license_key);
-        self.license_msg.clear();
-        self.license_open = true;
-    }
-
-    /// Open the Settings dialog, prefilling the saved TMDB Bearer token.
-    fn open_settings_dialog(&mut self) {
-        self.settings_token_input = self.settings.tmdb_bearer_token.clone();
-        self.settings_open = true;
-    }
-
-    /// Settings dialog: enter a TMDB v4 read access token (Bearer). Saving
-    /// persists it to settings and hands it to the worker so subsequent TMDB
-    /// requests authenticate with it.
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let mut open = true;
-        let mut do_save = false;
-        let mut do_cancel = false;
-
-        egui::Window::new("Settings")
-            .id(egui::Id::new("settings"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(360.0);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(title_text("Settings"));
-                    ui.add_space(8.0);
-                });
-
-                ui.label(body_text("TMDB Bearer Token"));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_token_input)
-                        .hint_text("Paste your v4 read access token")
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                ui.hyperlink_to(
-                    "To get a TMDB API Read Access Token…",
-                    TMDB_API_SETTINGS_URL,
-                );
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
-                    if ui.button("Save").clicked() {
-                        do_save = true;
-                    }
-                });
-            });
-
-        // Enter saves; Escape cancels.
-        let (enter, escape) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
-        if do_save || enter {
-            let token = self.settings_token_input.trim().to_string();
-            self.settings.tmdb_bearer_token = token.clone();
-            match self.settings.save() {
-                Ok(()) => self.status = "TMDB token saved.".into(),
-                Err(e) => self.status = format!("Failed to save settings: {e}"),
-            }
-            // Hand the new credential to the worker (empty clears it, falling
-            // back to environment variables).
-            let _ = self.worker.tx.send(Request::SetBearerToken(token));
-            self.settings_open = false;
-        } else if do_cancel || escape || !open {
-            self.settings_open = false;
-        }
-    }
-
-    /// Message dialog shown when a TMDB search is attempted without any
-    /// credential configured. Offers a shortcut into the Settings dialog.
-    fn no_credential_window(&mut self, ctx: &egui::Context) {
-        if !self.no_credential_open {
-            return;
-        }
-        let mut open = true;
-        let mut do_ok = false;
-        let mut do_settings = false;
-
-        egui::Window::new("TMDB credential required")
-            .id(egui::Id::new("no_credential"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(dialog_frame())
-            .show(ctx, |ui| {
-                ui.set_width(360.0);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(title_text("TMDB credential required"));
-                    ui.add_space(8.0);
-                });
-                ui.label(body_text(
-                    "A TMDB account and API Read Access Token are required \
-                     for TMDB searches.",
-                ));
-                ui.add_space(6.0);
-                ui.label(body_text(
-                    "Configure your TMDB Read Access Token in the Settings dialog.",
-                ));
-                ui.add_space(6.0);
-                ui.hyperlink_to(
-                    "To get a TMDB API Read Access Token…",
-                    TMDB_API_SETTINGS_URL,
-                );
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        do_ok = true;
-                    }
-                    if ui.button("Open Settings…").clicked() {
-                        do_settings = true;
-                    }
-                });
-            });
-
-        let (enter, escape) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
-        if do_settings {
-            self.no_credential_open = false;
-            self.open_settings_dialog();
-        } else if do_ok || enter || escape || !open {
-            self.no_credential_open = false;
-        }
-    }
-
-    /// Install the `tagtiger` CLI onto the user's PATH (macOS).
-    ///
-    /// The CLI ships beside the GUI executable inside the notarized app bundle
-    /// (`TagTiger.app/Contents/MacOS/tagtiger-cli`). Because this code runs from
-    /// the already-notarized app, creating the symlink here avoids the
-    /// Gatekeeper quarantine block that a loose `.command` script hits. We
-    /// symlink `/usr/local/bin/tagtiger` -> that binary, escalating with an
-    /// authorization prompt only when `/usr/local/bin` isn't writable.
-    #[cfg(target_os = "macos")]
-    fn install_cli(&mut self) {
-        use std::path::PathBuf;
-
-        // The CLI lives next to the running GUI executable.
-        let cli = match std::env::current_exe() {
-            Ok(exe) => exe
-                .parent()
-                .map(|dir| dir.join("tagtiger-cli"))
-                .unwrap_or_else(|| PathBuf::from("tagtiger-cli")),
-            Err(e) => {
-                self.status = format!("Couldn't locate the app executable: {e}");
-                return;
-            }
-        };
-        if !cli.exists() {
-            self.status = "Couldn't find the bundled CLI (tagtiger-cli) next to the app.".into();
-            return;
-        }
-
-        let dest = "/usr/local/bin/tagtiger";
-        let src = cli.to_string_lossy().to_string();
-
-        // Fast path: /usr/local/bin exists and is writable — link directly.
-        let bindir = std::path::Path::new("/usr/local/bin");
-        let writable_no_sudo = bindir.exists()
-            && std::fs::metadata(bindir)
-                .map(|m| {
-                    use std::os::unix::fs::PermissionsExt;
-                    // Writable by the current user in practice: try a probe.
-                    m.permissions().mode() & 0o200 != 0
-                })
-                .unwrap_or(false)
-            // A permission-bit check isn't authoritative (ownership matters), so
-            // confirm with an actual write probe.
-            && std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(bindir.join(".tagtiger-write-probe"))
-                .map(|_| {
-                    let _ = std::fs::remove_file(bindir.join(".tagtiger-write-probe"));
-                    true
-                })
-                .unwrap_or(false);
-
-        if writable_no_sudo {
-            // Replace any existing link/file, then create the symlink.
-            let _ = std::fs::remove_file(dest);
-            match std::os::unix::fs::symlink(&src, dest) {
-                Ok(()) => {
-                    self.status = format!("Installed CLI: run `tagtiger --help`. ({dest})");
-                }
-                Err(e) => self.status = format!("Failed to install CLI: {e}"),
-            }
-            return;
-        }
-
-        // Privileged path: prompt for admin rights via osascript. The shell
-        // command creates /usr/local/bin if needed and (re)creates the symlink.
-        // Paths are single-quoted for the shell; embedded single quotes in the
-        // source path are escaped defensively.
-        let esc = |s: &str| s.replace('\'', r"'\''");
-        let shell_cmd = format!(
-            "mkdir -p /usr/local/bin && ln -sf '{}' '{}'",
-            esc(&src),
-            esc(dest)
-        );
-        // osascript "do shell script ... with administrator privileges" wants a
-        // string literal; escape backslashes and double quotes for AppleScript.
-        let as_literal = shell_cmd.replace('\\', r"\\").replace('"', r#"\""#);
-        let script = format!("do shell script \"{as_literal}\" with administrator privileges");
-
-        match std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                self.status = format!("Installed CLI: run `tagtiger --help`. ({dest})");
-            }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                // User cancelling the auth prompt shows up as "User canceled."
-                if err.contains("User canceled") || err.contains("(-128)") {
-                    self.status = "CLI install cancelled.".into();
-                } else {
-                    self.status = format!("Failed to install CLI: {}", err.trim());
-                }
-            }
-            Err(e) => self.status = format!("Failed to run installer: {e}"),
-        }
-    }
-}
-
-/// egui version string, for the About "Built with" line.
-const EGUI_VERSION: &str = "0.36";
-const GLOWING_CAT_URL: &str = "https://glowingcat.com/TagTiger.html";
-const ISSUES_URL: &str = "https://github.com/richlesh/TagTiger/issues";
-/// Where users generate a TMDB v4 read access token.
-const TMDB_API_SETTINGS_URL: &str = "https://www.themoviedb.org/settings/api";
-
-/// A dark dialog background matching TagTiger's `#1e1e1e` panels.
-fn dialog_frame() -> egui::Frame {
-    egui::Frame::window(&egui::Style::default())
-        .fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e))
-        .inner_margin(egui::Margin::symmetric(28, 20))
-}
-
-/// Title text (`h1`): 20px, near-white.
-fn title_text(s: &str) -> egui::RichText {
-    egui::RichText::new(s)
-        .size(20.0)
-        .strong()
-        .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0))
-}
-
-/// Body text (`#e0e0e0`), 14px.
-fn body_text(s: &str) -> egui::RichText {
-    egui::RichText::new(s)
-        .size(14.0)
-        .color(egui::Color32::from_rgb(0xe0, 0xe0, 0xe0))
-}
-
-/// Muted secondary text (`#aaa`), 14px.
-fn muted_text(s: &str) -> egui::RichText {
-    egui::RichText::new(s)
-        .size(14.0)
-        .color(egui::Color32::from_rgb(0xaa, 0xaa, 0xaa))
-}
-
-/// Open a URL in the system browser. Best-effort; ignores failures.
-fn webbrowser_open(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-    }
-}
-
-/// Read plain text from the system clipboard, if any.
-fn read_clipboard_text() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard.get_text().ok()
-}
-
 /// Write an encoded image (PNG/JPEG bytes) to the system clipboard as an image.
 fn write_clipboard_image(bytes: &[u8]) -> Result<(), ()> {
     let img = image::load_from_memory(bytes).map_err(|_| ())?.to_rgba8();
     let (w, h) = (img.width() as usize, img.height() as usize);
 
-    // On macOS, also write a standard PNG pasteboard type. arboard writes only
-    // TIFF, which some apps (and the OS "no image" cases) don't surface; the
-    // PNG type is recognized everywhere. Re-encode the RGBA to PNG for this.
+    // On macOS, also write a standard PNG pasteboard type (arboard writes only
+    // TIFF, which some apps don't surface).
     #[cfg(target_os = "macos")]
     {
         let mut png = std::io::Cursor::new(Vec::new());
@@ -2523,7 +1811,6 @@ fn write_clipboard_image(bytes: &[u8]) -> Result<(), ()> {
         {
             return Ok(());
         }
-        // Fall through to arboard if the native write failed.
     }
 
     let data = arboard::ImageData {
@@ -2536,7 +1823,6 @@ fn write_clipboard_image(bytes: &[u8]) -> Result<(), ()> {
 }
 
 /// Read an image from the system clipboard and return it encoded as PNG.
-/// Returns `None` if the clipboard has no image or can't be read/encoded.
 fn read_clipboard_image_png() -> Option<Vec<u8>> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
@@ -2551,6 +1837,62 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod map_tests {
+    use super::*;
+    use tagtiger_core::model::{Definition, VideoKind};
+
+    #[test]
+    fn video_kind_index_roundtrip() {
+        // None maps to index 0 and back.
+        assert_eq!(video_kind_to_index(None), 0);
+        assert_eq!(index_to_video_kind(0), None);
+        // Every kind round-trips through its index.
+        for k in VideoKind::all() {
+            let i = video_kind_to_index(Some(*k));
+            assert!(i >= 1);
+            assert_eq!(index_to_video_kind(i), Some(*k));
+        }
+        // Index 1 is the first of VideoKind::all() (Movie) per ui/app.slint.
+        assert_eq!(index_to_video_kind(1), Some(VideoKind::all()[0]));
+    }
+
+    #[test]
+    fn definition_index_roundtrip() {
+        assert_eq!(definition_to_index(None), 0);
+        assert_eq!(index_to_definition(0), None);
+        for d in Definition::all() {
+            let i = definition_to_index(Some(*d));
+            assert!(i >= 1);
+            assert_eq!(index_to_definition(i), Some(*d));
+        }
+    }
+
+    #[test]
+    fn rating_index_roundtrip() {
+        // Empty rating -> "(none)" index 0.
+        assert_eq!(rating_to_index(""), 0);
+        assert_eq!(index_to_rating(0), "");
+        // Each concrete rating round-trips.
+        for r in MOVIE_RATINGS.iter().chain(TV_RATINGS.iter()) {
+            let i = rating_to_index(r);
+            assert!(i >= 1, "rating {r} should have a positive index");
+            assert_eq!(index_to_rating(i), *r);
+        }
+        // A specific known mapping: options[3] == "PG-13".
+        assert_eq!(index_to_rating(3), "PG-13");
+        assert_eq!(rating_to_index("PG-13"), 3);
+        // Unknown rating falls back to 0.
+        assert_eq!(rating_to_index("BOGUS"), 0);
+    }
+
+    #[test]
+    fn split_csv_trims_and_drops_empties() {
+        assert_eq!(split_csv("a, b ,,c"), vec!["a", "b", "c"]);
+        assert_eq!(split_csv("  "), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
 mod arg_tests {
     use super::{arg_to_movie_path, percent_decode};
     use std::ffi::OsStr;
@@ -2559,22 +1901,18 @@ mod arg_tests {
     fn percent_decode_basic() {
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("plain"), "plain");
-        // Invalid escapes are preserved.
         assert_eq!(percent_decode("100%done"), "100%done");
         assert_eq!(percent_decode("%2Fetc%2Ffile"), "/etc/file");
     }
 
     #[test]
     fn non_movie_args_rejected() {
-        // A CLI flag or a non-movie extension is not a movie path.
         assert!(arg_to_movie_path(OsStr::new("--some-flag")).is_none());
         assert!(arg_to_movie_path(OsStr::new("/tmp/notes.txt")).is_none());
     }
 
     #[test]
     fn movie_arg_and_uri_resolve_to_existing_file() {
-        // Create a temp .mp4 and check both a plain path and a file:// URI
-        // (with a percent-encoded space) resolve to it.
         let dir = std::env::temp_dir();
         let file = dir.join("tag tiger test.mp4");
         std::fs::write(&file, b"x").unwrap();
