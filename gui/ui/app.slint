@@ -369,6 +369,11 @@ export component MainWindow inherits Window {
     init => {
         Theme.dark = root.theme-dark;
         Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+        ClipCtx.current-poster = root.poster-selected;
+        ClipCtx.grid-poster = root.selected-poster-index >= 0;
+        ClipCtx.poster-locked = root.lock-poster;
+        ClipCtx.current-poster-has-image = root.has-cover;
+        ClipCtx.text-focused = TextInputInterface.text-input-focused;
     }
     changed theme-dark => {
         Theme.dark = root.theme-dark;
@@ -376,36 +381,34 @@ export component MainWindow inherits Window {
     }
 
     // Keep the ClipCtx global (drives the Edit menu's Cut/Copy/Paste enable +
-    // routing) in sync with the live focus/selection state. A hidden binder
-    // element mirrors the sources into the global reactively.
-    Rectangle {
-        width: 0px;
-        height: 0px;
+    // routing) in sync with the live focus/selection state.
+    //
+    // These `changed` handlers live on MainWindow (not a hidden element) because
+    // `changed` only fires for properties that are actually evaluated. The
+    // poster/lock/cover properties are read by the rendered UI, so their changes
+    // are observed here. `text-focused` is bound from the built-in
+    // TextInputInterface via the always-evaluated `text-focus-tracker` below.
+    changed poster-selected => { ClipCtx.current-poster = root.poster-selected; }
+    changed selected-poster-index => { ClipCtx.grid-poster = root.selected-poster-index >= 0; }
+    changed lock-poster => { ClipCtx.poster-locked = root.lock-poster; }
+    changed has-cover => { ClipCtx.current-poster-has-image = root.has-cover; }
+
+    // Text-focus tracker: a visible (1x1, transparent) element whose color
+    // binding reads TextInputInterface.text-input-focused, forcing Slint to
+    // evaluate it so the `changed` handler fires. Mirrors focus into ClipCtx and
+    // clears any poster selection when a field gains focus.
+    text-focus-tracker := Rectangle {
+        width: 1px;
+        height: 1px;
         property <bool> tf: TextInputInterface.text-input-focused;
-        property <bool> cp: root.poster-selected;
-        property <bool> gp: root.selected-poster-index >= 0;
-        property <bool> pl: root.lock-poster;
-        property <bool> ci: root.has-cover;
-        init => {
-            ClipCtx.text-focused = self.tf;
-            ClipCtx.current-poster = self.cp;
-            ClipCtx.grid-poster = self.gp;
-            ClipCtx.poster-locked = self.pl;
-            ClipCtx.current-poster-has-image = self.ci;
-        }
+        // Reading `tf` in a rendered binding keeps the property observed.
+        background: self.tf ? transparent : transparent;
         changed tf => {
             ClipCtx.text-focused = self.tf;
-            // Focusing a text field takes clipboard focus: clear any poster
-            // selection so Cut/Copy/Paste target the field (and the poster
-            // highlight goes away).
             if self.tf {
                 root.clear-poster-selection();
             }
         }
-        changed cp => { ClipCtx.current-poster = self.cp; }
-        changed gp => { ClipCtx.grid-poster = self.gp; }
-        changed pl => { ClipCtx.poster-locked = self.pl; }
-        changed ci => { ClipCtx.current-poster-has-image = self.ci; }
     }
 
     // A focusable, zero-size sink used to move keyboard focus off any text field
@@ -579,6 +582,12 @@ export component MainWindow inherits Window {
                 enabled: root.file-loaded && !root.writing;
                 shortcut: @keys(Control + S);
                 activated => { root.write-tags(); }
+            }
+            MenuItem {
+                title: "Search TMDB";
+                enabled: root.file-loaded;
+                shortcut: @keys(Control + F);
+                activated => { root.do-search(); }
             }
             MenuSeparator {}
             // On macOS, Settings lives in the application menu (under About);

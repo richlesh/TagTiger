@@ -134,21 +134,34 @@ impl Definition {
         }
     }
 
-    /// Deduce the definition from a video track's pixel dimensions. Uses the
-    /// larger of width/height against common thresholds so both landscape and
-    /// portrait content classify sensibly.
+    /// Deduce the definition from a video track's pixel dimensions.
+    ///
+    /// Content is mastered at a standard *line count* (480/576 for SD, 720,
+    /// 1080, 2160). Cropping or letterboxing only ever *reduces* the stored
+    /// height below the master's line count — it never exceeds it. So a frame's
+    /// number of lines gives a firm upper bound on the tier: a 720p master is
+    /// never taller than 720, a 1080p master never taller than 1080, etc. We
+    /// therefore classify by height *ceilings* (with width clauses as a safety
+    /// net for ultra-wide crops), which — unlike the old "just under" floors —
+    /// correctly handles cropped/letterboxed 1080p (e.g. 1892×776) and
+    /// pillarboxed 4:3 1080p (e.g. 1440×1080).
+    ///
+    /// `w`/`h` are the long/short edges so the result is rotation-agnostic.
     pub fn from_dimensions(width: u32, height: u32) -> Definition {
-        // Classify by the number of horizontal lines (height) primarily, but
-        // fall back to width for very wide content.
-        let w = width.max(height);
-        let h = width.min(height);
-        if w >= 3200 || h >= 1600 {
+        let w = width.max(height); // long edge
+        let h = width.min(height); // number of lines (short edge for landscape)
+
+        if h > 1080 || w > 1920 {
+            // More than 1080 lines (or wider than a 1080p frame) → 4K/UHD.
             Definition::Uhd4k
-        } else if w >= 1900 || h >= 1000 {
+        } else if h > 720 || w > 1280 {
+            // 721–1080 lines (or wider than a 720p frame) → 1080p.
             Definition::Hd1080
-        } else if w >= 1200 || h >= 700 {
+        } else if h > 576 || w > 1024 {
+            // Up to 720 lines but bigger than SD → 720p.
             Definition::Hd720
         } else {
+            // DVD-era and smaller (≤576 lines, ≤1024 wide) → SD.
             Definition::Sd
         }
     }
@@ -282,4 +295,52 @@ pub struct MediaQuery {
     /// Present for episode lookups.
     pub season: Option<u32>,
     pub episode: Option<u32>,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{Definition, Definition::*};
+
+    /// Deduce the definition, asserting it's stable under axis swap (portrait).
+    fn deduce(w: u32, h: u32) -> Definition {
+        let a = Definition::from_dimensions(w, h);
+        let b = Definition::from_dimensions(h, w);
+        assert_eq!(a, b, "classification must be rotation-agnostic for {w}x{h}");
+        a
+    }
+
+    #[test]
+    fn definition_from_dimensions_table() {
+        // (width, height, expected) — covers the cases discussed: cropped and
+        // pillarboxed 1080p, standard tiers, SD, and 4K (incl. ultra-wide crop).
+        let cases = [
+            (1892, 776, Hd1080),  // cropped/letterboxed 1080p (the reported bug)
+            (1440, 1080, Hd1080), // 4:3 1080p (pillarboxed)
+            (1440, 996, Hd1080),  // slightly-cropped 4:3 1080p
+            (1920, 1080, Hd1080), // 16:9 1080p
+            (1280, 720, Hd720),   // 16:9 720p
+            (960, 720, Hd720),    // 4:3 720p
+            (720, 576, Sd),       // PAL SD
+            (640, 480, Sd),       // NTSC SD
+            (3840, 2160, Uhd4k),  // 16:9 4K
+            (3840, 1600, Uhd4k),  // ultra-wide (2.40:1) 4K crop
+        ];
+        for (w, h, expected) in cases {
+            assert_eq!(deduce(w, h), expected, "{w}x{h} should be {expected:?}");
+        }
+    }
+
+    #[test]
+    fn definition_tier_boundaries() {
+        // A 720p master never exceeds 720 lines; anything above is at least 1080p.
+        assert_eq!(deduce(1280, 720), Hd720);
+        assert_eq!(deduce(1281, 721), Hd1080);
+        // A 1080p master never exceeds 1080 lines; above is 4K.
+        assert_eq!(deduce(1920, 1080), Hd1080);
+        assert_eq!(deduce(1921, 1081), Uhd4k);
+        // SD ceiling: PAL 576 lines is SD, just above is 720p.
+        assert_eq!(deduce(720, 576), Sd);
+        assert_eq!(deduce(1025, 577), Hd720);
+    }
 }
