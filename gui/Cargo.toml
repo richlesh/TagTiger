@@ -50,7 +50,7 @@ windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_
 # Linux: read the XDG desktop-portal accent color over D-Bus. Version matches
 # Slint's winit backend.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5.14", default-features = false, features = ["async-io"] }
+zbus = { version = "5.14", default-features = false, features = ["async-io", "blocking-api"] }
 
 # Windows: embed the .ico into the executable at build time.
 [target.'cfg(windows)'.build-dependencies]
