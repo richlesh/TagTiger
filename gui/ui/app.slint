@@ -1,0 +1,1434 @@
+// TagTiger main window (Slint).
+//
+// Step 2: the editor UI surface — menu bar, search row, editable field form
+// with per-field locks, Video Kind / Definition / Rating dropdowns, Fast-start
+// toggle, current-poster panel, TMDB poster grid, Write button, matches list,
+// and a status bar. Callbacks and properties are declared here and wired to the
+// Rust controller (and the background Worker) in step 3. Dialogs are added in
+// step 4.
+
+import {
+    Button,
+    ComboBox,
+    CheckBox,
+    LineEdit,
+    TextEdit,
+    ScrollView,
+    ListView,
+    VerticalBox,
+    HorizontalBox,
+    GroupBox,
+    StandardButton,
+    Palette,
+} from "std-widgets.slint";
+
+// App-wide theme colors, derived from the built-in Palette (whose color-scheme
+// the controller sets to match the Light/Dark setting). Custom surfaces (window
+// background, dialog cards, scrim, muted text, links) read from here so the
+// whole UI — not just the built-in widgets — follows the selected theme.
+export global Theme {
+    // True when the active color scheme is dark. Bound from MainWindow so the
+    // built-in Palette and our own colors stay in lockstep.
+    in property <bool> dark: true;
+
+    out property <brush> window-bg: Palette.background;
+    out property <brush> text: Palette.foreground;
+    out property <brush> muted-text: dark ? #9a9a9a : #666666;
+    out property <brush> card-bg: dark ? #262626 : #f4f4f4;
+    out property <brush> border: dark ? #4a4a4a : #cccccc;
+    out property <brush> scrim: dark ? #000000c0 : #00000060;
+    out property <brush> link: dark ? #5c9dff : #0a58ca;
+    out property <brush> link-hover: dark ? #7fb0ff : #3b7dd8;
+    out property <brush> hairline: dark ? #666666 : #cccccc;
+    out property <brush> hover-row: dark ? #ffffff14 : #00000010;
+    out property <brush> error-text: dark ? #e0a0a0 : #b00020;
+    out property <brush> placeholder-text: dark ? #999999 : #888888;
+    // System selection/highlight colors. The controller reads the real OS
+    // colors (macOS: NSColor.controlAccentColor / selectedContentBackgroundColor;
+    // other platforms via Slint's Palette) and pushes them in here so the whole
+    // UI matches the user's chosen accent/highlight color. When `has-sys-colors`
+    // is false we fall back to Slint's Palette defaults.
+    in property <bool> has-sys-colors: false;
+    in property <brush> sys-highlight: #808080;
+    in property <brush> sys-highlight-text: #ffffff;
+    in property <brush> sys-accent: #808080;
+
+    out property <brush> highlight: has-sys-colors ? sys-highlight : Palette.selection-background;
+    out property <brush> highlight-text: has-sys-colors ? sys-highlight-text : Palette.selection-foreground;
+    // Accent used for the progress bar fill and other filled indicators.
+    out property <brush> accent: has-sys-colors ? sys-accent : Palette.selection-background;
+}
+
+// Clipboard focus context: which target Cut/Copy/Paste act on, so the Edit menu
+// items enable/route correctly.
+//   - `text-focused`  — a metadata text field has keyboard focus; text ops go to
+//                       the field (native selection). Bound from the built-in
+//                       TextInputInterface.text-input-focused.
+//   - `current-poster`— the current-cover poster is selected (Cut/Copy/Paste all
+//                       apply, respecting the poster lock).
+//   - `grid-poster`   — a TMDB grid poster is selected (Copy only).
+// When nothing is focused/selected, all three are disabled.
+export global ClipCtx {
+    in property <bool> text-focused: false;
+    in property <bool> current-poster: false;
+    in property <bool> grid-poster: false;
+    in property <bool> poster-locked: false;
+    in property <bool> current-poster-has-image: false;
+
+    // Menu Cut/Copy/Paste enablement. IMPORTANT: these deliberately do NOT
+    // include `text-focused`. A menubar `shortcut:` is matched by Slint *before*
+    // the key reaches the focused item AND only for *enabled* items, so if these
+    // were enabled while a text field is focused, the Cut/Copy/Paste
+    // accelerators (Cmd/Ctrl+X/C/V) would be intercepted and the focused
+    // TextInput would never perform its own native cut/copy/paste. By enabling
+    // the menu items only for poster selections, a focused field handles the
+    // shortcuts natively, while the menu items (and their accelerators) act on
+    // the selected poster when no field is focused.
+    out property <bool> can-cut:
+        root.current-poster && root.current-poster-has-image && !root.poster-locked;
+    out property <bool> can-copy:
+        (root.current-poster && root.current-poster-has-image) || root.grid-poster;
+    out property <bool> can-paste:
+        root.current-poster && !root.poster-locked;
+}
+
+// One TMDB search result shown in the Matches list.
+export struct MatchItem {
+    title: string,
+    year: string,
+}
+
+// One poster tile in the TMDB poster grid (or a placeholder while loading).
+export struct PosterItem {
+    image: image,
+    loaded: bool,
+    size: string,   // e.g. "500 x 750", shown under the thumbnail
+}
+
+// Custom single-line input. Built on the primitive `TextInput` (rather than the
+// std-widget `LineEdit`) so we control the internal vertical padding directly —
+// the built-in widget bakes in ~8px top/bottom, which visually clips the text
+// in our tight rows. Here we use half that (4px) while keeping the themed
+// border, placeholder, selection colors, and enabled state.
+component TigerLineEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder-text;
+    in property <bool> enabled: true;
+    callback edited();
+    callback accepted();
+
+    // Internal padding: half the std LineEdit's ~8px vertical padding, with a
+    // couple extra px on top so the (centered) text isn't cramped against the
+    // border.
+    property <length> pad-v: 4px;
+    property <length> pad-top: 6px;
+    property <length> pad-h: 8px;
+
+    height: input.preferred-height + root.pad-top + root.pad-v;
+    border-width: 1px;
+    border-radius: 4px;
+    border-color: input.has-focus ? Theme.highlight : Theme.border;
+    background: root.enabled ? Theme.window-bg : Theme.card-bg;
+    clip: true;
+    forward-focus: input;
+
+    // Placeholder shown when empty and unfocused.
+    if input.text == "" && !input.has-focus: Text {
+        x: root.pad-h;
+        y: root.pad-top;
+        width: parent.width - root.pad-h * 2;
+        height: parent.height - root.pad-top - root.pad-v;
+        text: root.placeholder-text;
+        color: Theme.placeholder-text;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    input := TextInput {
+        property <length> computed-x;
+        // Padding-aware horizontal scroll: keep the text within [pad-h .. width-pad-h]
+        // and shift computed-x so the cursor stays visible (the primitive
+        // TextInput doesn't auto-scroll). Mirrors the std LineEdit base.
+        x: min(root.pad-h, max(parent.width - root.pad-h - self.width - self.text-cursor-width, self.computed-x));
+        y: root.pad-top;
+        width: max(parent.width - root.pad-h * 2 - self.text-cursor-width, self.preferred-width);
+        height: parent.height - root.pad-top - root.pad-v;
+        color: root.enabled ? Theme.text : Theme.muted-text;
+        selection-background-color: Theme.highlight;
+        selection-foreground-color: Theme.highlight-text;
+        enabled: root.enabled;
+        single-line: true;
+        vertical-alignment: center;
+        edited => { root.edited(); }
+        accepted => { root.accepted(); }
+
+        cursor-position-changed(cpos) => {
+            if cpos.x + self.computed-x < root.pad-h {
+                self.computed-x = -cpos.x + root.pad-h;
+            } else if cpos.x + self.computed-x > parent.width - root.pad-h - self.text-cursor-width {
+                self.computed-x = parent.width - cpos.x - root.pad-h - self.text-cursor-width;
+            }
+        }
+    }
+}
+
+// Custom multi-line input, same rationale as TigerLineEdit: control the
+// vertical padding (half the std TextEdit's) so text isn't clipped, with a
+// scrollable text area for long content.
+component TigerTextEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    in property <bool> word-wrap: true;
+    callback edited();
+
+    property <length> pad-v: 4px;
+    property <length> pad-top: 7px;   // a few px more at the top so text isn't cramped
+    property <length> pad-h: 8px;
+
+    border-width: 1px;
+    border-radius: 4px;
+    border-color: input.has-focus ? Theme.highlight : Theme.border;
+    background: root.enabled ? Theme.window-bg : Theme.card-bg;
+    clip: true;
+    forward-focus: input;
+
+    scroll := ScrollView {
+        x: root.pad-h;
+        y: root.pad-top;
+        width: parent.width - root.pad-h * 2;
+        height: parent.height - root.pad-top - root.pad-v;
+        content-width: root.word-wrap ? self.visible-width : max(self.visible-width, input.preferred-width);
+        content-height: max(self.visible-height, input.preferred-height);
+
+        input := TextInput {
+            width: parent.width;
+            color: root.enabled ? Theme.text : Theme.muted-text;
+            selection-background-color: Theme.highlight;
+            selection-foreground-color: Theme.highlight-text;
+            enabled: root.enabled;
+            single-line: false;
+            wrap: root.word-wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
+            page-height: scroll.visible-height;
+            edited => { root.edited(); }
+
+            // The primitive TextInput does not auto-scroll to the cursor; the
+            // enclosing widget must, using cursor-position-changed. Mirrors the
+            // std TextEdit's logic (20px ~ one line height).
+            cursor-position-changed(cpos) => {
+                if (cpos.x + scroll.content-x < 0px) {
+                    scroll.content-x = min(0px, max(scroll.visible-width - self.width, -cpos.x));
+                } else if (cpos.x + scroll.content-x > scroll.visible-width) {
+                    scroll.content-x = min(0px, max(scroll.visible-width - self.width, scroll.visible-width - cpos.x));
+                }
+                if (cpos.y + scroll.content-y < 0px) {
+                    scroll.content-y = min(
+                        0px,
+                        scroll.visible-height - cpos.y - 20px,
+                        max(scroll.visible-height - self.height, -cpos.y),
+                    );
+                } else if (cpos.y + scroll.content-y > scroll.visible-height - 20px) {
+                    scroll.content-y = min(0px, max(scroll.visible-height - self.height, scroll.visible-height - cpos.y - 20px));
+                }
+            }
+        }
+    }
+}
+
+// A labelled single-line field with a per-field Lock checkbox. The label is
+// right-aligned in a fixed-width cell so all inputs line up.
+component FieldRow inherits HorizontalBox {
+    in property <string> label;
+    in-out property <string> value;
+    in-out property <bool> locked;
+    in property <length> label-width: 190px;
+    callback edited();
+    callback commit();
+
+    spacing: 8px;
+    padding: 0px;
+    Text {
+        text: root.label;
+        width: root.label-width;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+    TigerLineEdit {
+        horizontal-stretch: 1;
+        text <=> root.value;
+        enabled: !root.locked;
+        edited => { root.edited(); }
+        accepted => { root.commit(); }
+    }
+    CheckBox {
+        text: "Lock";
+        checked <=> root.locked;
+    }
+}
+
+// A labelled multi-line field (Cast/Directors/etc. or long text) with a Lock.
+component PeopleRow inherits HorizontalBox {
+    in property <string> label;
+    in-out property <string> value;
+    in-out property <bool> locked;
+    in property <length> label-width: 190px;
+    in property <length> input-height: 34px;
+    callback edited();
+
+    spacing: 8px;
+    padding: 0px;
+    Text {
+        text: root.label;
+        width: root.label-width;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+    TigerTextEdit {
+        horizontal-stretch: 1;
+        height: root.input-height;
+        text <=> root.value;
+        enabled: !root.locked;
+        word-wrap: true;
+        edited => { root.edited(); }
+    }
+    CheckBox {
+        text: "Lock";
+        checked <=> root.locked;
+    }
+}
+
+// A clickable text link. Emits `activated` with the URL to open.
+component Hyperlink inherits TouchArea {
+    in property <string> text;
+    in property <string> url;
+    callback open-url(string);
+    mouse-cursor: pointer;
+    Text {
+        text: root.text;
+        color: touch-hover ? Theme.link-hover : Theme.link;
+        horizontal-alignment: center;
+    }
+    property <bool> touch-hover: root.has-hover;
+    clicked => { root.open-url(root.url); }
+}
+
+// A full-window dark scrim with a centered dark card. `dismiss` fires when the
+// scrim (outside the card) is clicked.
+component DialogScrim inherits Rectangle {
+    callback dismiss();
+    background: Theme.scrim;
+    // Catch clicks on the scrim so they don't fall through to the editor.
+    TouchArea {
+        clicked => { root.dismiss(); }
+    }
+    @children
+}
+
+// A square icon button that highlights in the system highlight color on hover.
+// The icon is colorized to the theme text color (or the highlight-contrast
+// color while hovered), and a tooltip is shown on hover.
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    // Square: match width to height.
+    property <length> side: 30px;
+    width: root.side;
+    height: root.side;
+    border-radius: 5px;
+    background: !root.enabled
+        ? transparent
+        : (touch.pressed ? Theme.highlight.darker(0.2)
+            : (touch.has-hover ? Theme.highlight : transparent));
+
+    Image {
+        source: root.icon;
+        colorize: root.enabled
+            ? (touch.has-hover ? Theme.highlight-text : Theme.text)
+            : Theme.muted-text;
+        width: 20px;
+        height: 20px;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Tooltip { text: @markdown("\{root.tooltip}"); }
+}
+
+export component MainWindow inherits Window {
+    title: "TagTiger";
+    preferred-width: 1030px;
+    preferred-height: 720px;
+    min-width: 760px;
+    min-height: 560px;
+    icon: root.window-icon;
+    background: Theme.window-bg;
+
+    // Theme: the controller sets `theme-dark` from the persisted Light/Dark
+    // setting; we propagate it to the `Theme` global (our custom colors) and
+    // the built-in widget `Palette` on init and whenever it changes.
+    in property <bool> theme-dark: true;
+    init => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+        ClipCtx.current-poster = root.poster-selected;
+        ClipCtx.grid-poster = root.selected-poster-index >= 0;
+        ClipCtx.poster-locked = root.lock-poster;
+        ClipCtx.current-poster-has-image = root.has-cover;
+        ClipCtx.text-focused = TextInputInterface.text-input-focused;
+    }
+    changed theme-dark => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    // Keep the ClipCtx global (drives the Edit menu's Cut/Copy/Paste enable +
+    // routing) in sync with the live focus/selection state.
+    //
+    // These `changed` handlers live on MainWindow (not a hidden element) because
+    // `changed` only fires for properties that are actually evaluated. The
+    // poster/lock/cover properties are read by the rendered UI, so their changes
+    // are observed here. `text-focused` is bound from the built-in
+    // TextInputInterface via the always-evaluated `text-focus-tracker` below.
+    changed poster-selected => { ClipCtx.current-poster = root.poster-selected; }
+    changed selected-poster-index => { ClipCtx.grid-poster = root.selected-poster-index >= 0; }
+    changed lock-poster => { ClipCtx.poster-locked = root.lock-poster; }
+    changed has-cover => { ClipCtx.current-poster-has-image = root.has-cover; }
+
+    // Text-focus tracker: a visible (1x1, transparent) element whose color
+    // binding reads TextInputInterface.text-input-focused, forcing Slint to
+    // evaluate it so the `changed` handler fires. Mirrors focus into ClipCtx and
+    // clears any poster selection when a field gains focus.
+    text-focus-tracker := Rectangle {
+        width: 1px;
+        height: 1px;
+        property <bool> tf: TextInputInterface.text-input-focused;
+        // Reading `tf` in a rendered binding keeps the property observed.
+        background: self.tf ? transparent : transparent;
+        changed tf => {
+            ClipCtx.text-focused = self.tf;
+            if self.tf {
+                root.clear-poster-selection();
+            }
+        }
+    }
+
+    // A focusable, zero-size sink used to move keyboard focus off any text field
+    // when a poster is selected (so Cut/Copy/Paste target the poster, and the
+    // text-field selection highlight clears). `defocus-text()` is invoked from
+    // the poster click handlers.
+    defocus-sink := FocusScope {
+        width: 0px;
+        height: 0px;
+    }
+    public function defocus-text() {
+        defocus-sink.focus();
+    }
+
+    // ---- Window / app state (set by the controller) --------------------
+    in property <image> window-icon;
+    in property <string> status: "Open an MP4/M4V file to begin.";
+    in property <bool> file-loaded: false;
+    in property <bool> loading-details: false;
+    in property <bool> writing: false;
+
+    // ---- Search --------------------------------------------------------
+    in-out property <string> search-query;
+
+    // ---- Editable fields ----------------------------------------------
+    in-out property <string> title-text;
+    in-out property <string> year-text;
+    in-out property <string> rating-text;
+    in-out property <string> summary-text;
+    in-out property <string> overview-text;
+    in-out property <string> genres-text;
+    in-out property <string> cast-text;
+    in-out property <string> directors-text;
+    in-out property <string> producers-text;
+    in-out property <string> writers-text;
+    in-out property <string> studio-text;
+
+    // ---- Per-field locks ----------------------------------------------
+    in-out property <bool> lock-title;
+    in-out property <bool> lock-year;
+    in-out property <bool> lock-rating;
+    in-out property <bool> lock-summary;
+    in-out property <bool> lock-overview;
+    in-out property <bool> lock-genres;
+    in-out property <bool> lock-cast;
+    in-out property <bool> lock-directors;
+    in-out property <bool> lock-producers;
+    in-out property <bool> lock-writers;
+    in-out property <bool> lock-studio;
+    in-out property <bool> lock-poster;
+    in-out property <bool> lock-video-kind;
+
+    // ---- Dropdowns (string models; controller maps to core enums) ------
+    // Index 0 is always "(none)".
+    in property <[string]> video-kind-options: ["(none)", "Movie", "TV Show", "Music Video", "Home Video", "Booklet"];
+    in-out property <int> video-kind-index: 0;
+    in property <[string]> definition-options: ["(none)", "SD", "HD 720p", "HD 1080p", "4K"];
+    in-out property <int> definition-index: 0;
+    in property <[string]> rating-options: ["(none)", "G", "PG", "PG-13", "R", "NC-17", "Not Rated", "Unrated", "TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
+    in-out property <int> rating-index: 0;
+
+    in-out property <bool> fast-start;
+    in property <string> video-dimensions;   // e.g. "1920 x 1080" or ""
+
+    // ---- Current cover / poster ---------------------------------------
+    in property <image> cover-image;
+    in property <bool> has-cover: false;
+    in property <bool> poster-selected: false;
+    in property <string> cover-size-caption: "— x —";
+
+    // ---- Matches (TMDB search results) --------------------------------
+    in property <[MatchItem]> matches;
+    // Index of the selected match row (-1 = none), highlighted in the list.
+    in property <int> selected-match-index: -1;
+
+    // ---- TMDB poster choices ------------------------------------------
+    in property <[PosterItem]> posters;
+    // Index of the selected poster tile (-1 = none), highlighted in the grid.
+    in property <int> selected-poster-index: -1;
+
+    // ---- Undo/redo availability (drives Edit menu enabled state) ------
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+
+    // ---- Dialog state --------------------------------------------------
+    in property <image> app-icon;                 // 96px icon for dialogs
+    in property <string> app-version;
+    in property <bool> show-about: false;
+    in property <bool> about-licensed: false;
+    in property <bool> show-splash: false;
+    in property <bool> show-license: false;
+    in-out property <string> license-email;
+    in-out property <string> license-key;
+    in property <bool> license-valid: false;
+    in property <string> license-msg;
+    in property <bool> show-settings: false;
+    in-out property <string> settings-token;
+    // Theme selector: 0 = Light, 1 = Dark (matches the Settings ComboBox model).
+    in-out property <int> settings-theme-index: 1;
+    in property <bool> show-no-credential: false;
+    in property <bool> show-lightbox: false;
+    in property <image> lightbox-image;
+    in property <bool> lightbox-loaded: false;
+    in property <bool> show-progress: false;
+    in property <float> progress-fraction: 0.0;
+    in property <string> progress-caption;
+    in property <string> progress-phase;
+    in property <bool> show-complete: false;
+    in property <string> complete-msg;
+
+    // ---- Callbacks (wired to the controller) --------------------------
+    callback open-file();
+    callback open-settings();
+    callback quit();
+    callback do-undo();
+    callback do-redo();
+    callback do-cut();
+    callback do-copy();
+    callback do-paste();
+    callback open-license();
+    callback install-cli();
+    callback open-about();
+    callback do-search();
+    callback select-match(int);          // index into `matches`
+    callback field-edited();             // any field changed (coalesced undo)
+    callback field-commit();             // field lost focus / accepted
+    callback video-kind-changed(int);
+    callback definition-changed(int);
+    callback rating-changed(int);
+    callback fast-start-changed(bool);
+    callback poster-clicked();           // toggle current-cover selection
+    callback clear-poster-selection();   // drop poster selection (text focused)
+    callback poster-double-clicked();    // open lightbox on current cover
+    callback poster-choice-clicked(int); // set TMDB poster #index as cover
+    callback poster-choice-double-clicked(int);
+    // Reports the visible poster-grid row range (first, last inclusive) and the
+    // column count, so the controller can lazily fetch only visible thumbnails.
+    callback poster-rows-visible(int, int, int);
+    callback write-tags();
+    // Dialog callbacks.
+    callback open-url(string);           // open a hyperlink in the browser
+    callback about-ok();
+    callback splash-dismiss();
+    callback license-cancel();
+    callback license-save();
+    callback license-key-edited();       // reformat key as the user types
+    callback settings-cancel();
+    callback settings-save();
+    callback theme-changed(int);         // 0 = Light, 1 = Dark (live apply)
+    callback no-cred-ok();
+    callback no-cred-open-settings();
+    callback lightbox-close();
+    callback complete-ok();
+
+    // Whether this platform shows the "Install Command-Line Tool" item.
+    in property <bool> show-install-cli: false;
+    // True on macOS, where About/Quit live in the application menu rather than
+    // the File/Help menus.
+    in property <bool> is-macos: false;
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Open…";
+                enabled: !root.writing;
+                shortcut: @keys(Control + O);
+                activated => { root.open-file(); }
+            }
+            MenuItem {
+                title: "Write Tags";
+                enabled: root.file-loaded && !root.writing;
+                shortcut: @keys(Control + S);
+                activated => { root.write-tags(); }
+            }
+            MenuItem {
+                title: "Search TMDB";
+                enabled: root.file-loaded && !root.writing;
+                shortcut: @keys(Control + F);
+                activated => { root.do-search(); }
+            }
+            MenuSeparator {}
+            // On macOS, Settings lives in the application menu (under About);
+            // on Windows/Linux it stays here in File.
+            if !root.is-macos: MenuItem { title: "Settings…"; activated => { root.open-settings(); } }
+            // On macOS, Quit lives in the application menu, not File.
+            if !root.is-macos: MenuSeparator {}
+            if !root.is-macos: MenuItem {
+                title: "Quit";
+                shortcut: @keys(Control + Q);
+                activated => { root.quit(); }
+            }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem {
+                title: "Undo";
+                enabled: root.can-undo;
+                shortcut: @keys(Control + Z);
+                activated => { root.do-undo(); }
+            }
+            MenuItem {
+                title: "Redo";
+                enabled: root.can-redo;
+                shortcut: @keys(Control + Shift + Z);
+                activated => { root.do-redo(); }
+            }
+            MenuSeparator {}
+            // Cut/Copy/Paste act on the selected poster (current cover, or a TMDB
+            // grid poster for Copy). They carry Cmd/Ctrl+X/C/V accelerators.
+            //
+            // These items are enabled ONLY for poster selections (see
+            // ClipCtx.can-*, which excludes text focus). That is deliberate: a
+            // menubar `shortcut:` is matched by Slint before the key reaches the
+            // focused item, and only for *enabled* items. So while a text field
+            // is focused these items are disabled → their accelerators don't
+            // register → the focused TextInput handles Cmd/Ctrl+X/C/V natively.
+            // When a poster is selected the items enable and the accelerators act
+            // on the poster.
+            MenuItem {
+                title: "Cut";
+                enabled: ClipCtx.can-cut;
+                shortcut: @keys(Control + X);
+                activated => { root.do-cut(); }
+            }
+            MenuItem {
+                title: "Copy";
+                enabled: ClipCtx.can-copy;
+                shortcut: @keys(Control + C);
+                activated => { root.do-copy(); }
+            }
+            MenuItem {
+                title: "Paste";
+                enabled: ClipCtx.can-paste;
+                shortcut: @keys(Control + V);
+                activated => { root.do-paste(); }
+            }
+        }
+        Menu {
+            title: "Help";
+            MenuItem { title: "License Key…"; activated => { root.open-license(); } }
+            MenuItem {
+                title: "Install Command-Line Tool…";
+                enabled: root.show-install-cli;
+                activated => { root.install-cli(); }
+            }
+            // On macOS, About lives in the application menu, not Help.
+            if !root.is-macos: MenuSeparator {}
+            if !root.is-macos: MenuItem { title: "About TagTiger"; activated => { root.open-about(); } }
+        }
+    }
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 6px;
+
+        // Top action row (fixed): Open + Write icon buttons + status text.
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            vertical-stretch: 0;
+            IconButton {
+                icon: @image-url("icons/folder-open.svg");
+                tooltip: "Open File";
+                // Blocked while a tag-write is in progress.
+                enabled: !root.writing;
+                clicked => { root.open-file(); }
+            }
+            IconButton {
+                icon: @image-url("icons/floppy-disk.svg");
+                tooltip: "Write Tags";
+                // Only meaningful once a file is open; also blocked mid-write.
+                enabled: root.file-loaded && !root.writing;
+                clicked => { root.write-tags(); }
+            }
+            // Status area: shows the status text, or — while saving — an inline
+            // progress bar with a MiB caption (no separate dialog).
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
+                horizontal-stretch: 1;
+                if !root.show-progress: Text {
+                    text: root.status;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                if root.show-progress: Text {
+                    text: root.progress-phase == ""
+                        ? "Saving…"
+                        : "Saving — " + root.progress-phase + "…";
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                }
+                // Wrap the fixed-height bar so it centers vertically in the row
+                // (a bare fixed-height child would pin to the top). Custom bar so
+                // the fill uses our accent color (which follows the OS accent),
+                // not Slint's hardcoded Fluent blue.
+                // A full-height container (stretched by the HorizontalBox) holds
+                // the fixed-height bar centered vertically. Centering via `y`
+                // only works inside a non-layout parent, hence this wrapper.
+                if root.show-progress: Rectangle {
+                    horizontal-stretch: 1;
+                    bar := Rectangle {
+                        width: 100%;
+                        height: 6px;
+                        y: (parent.height - self.height) / 2;
+                        // Track.
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: self.height / 2;
+                            background: Theme.hairline;
+                        }
+                        // Fill.
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * min(1.0, max(0.0, root.progress-fraction));
+                            height: 100%;
+                            border-radius: self.height / 2;
+                            background: Theme.accent;
+                        }
+                    }
+                }
+                if root.show-progress: Text {
+                    text: root.progress-caption;
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Main body: editor (left) + matches (right).
+        HorizontalBox {
+            padding: 0px;
+            spacing: 10px;
+            vertical-stretch: 1;
+
+            // ---- Left: editor -----------------------------------------
+            editor := Rectangle {
+                horizontal-stretch: 1;
+                if !root.file-loaded: Text {
+                    text: "Open a file to begin.";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                if root.file-loaded: editor-scroll := ScrollView {
+                    VerticalBox {
+                        padding: 0px;
+                        spacing: 6px;
+                        alignment: start;
+
+                        // Search row.
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 8px;
+                            Text {
+                                text: "Search:";
+                                width: 190px;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                placeholder-text: "Movie title";
+                                text <=> root.search-query;
+                                accepted => { root.do-search(); }
+                            }
+                            // Search button: highlights in the system highlight
+                            // color on hover (the std Button shows no hover state
+                            // in the native macOS style), mirroring IconButton.
+                            // Disabled while a tag-write is in progress.
+                            Rectangle {
+                                property <bool> enabled: !root.writing;
+                                width: 34px;
+                                height: 30px;
+                                border-radius: 5px;
+                                border-width: 1px;
+                                border-color: (self.enabled && search-touch.has-hover) ? Theme.highlight : Theme.border;
+                                background: !self.enabled
+                                    ? transparent
+                                    : (search-touch.pressed
+                                        ? Theme.highlight.darker(0.2)
+                                        : (search-touch.has-hover ? Theme.highlight : transparent));
+                                Image {
+                                    source: @image-url("icons/magnifying-glass.svg");
+                                    colorize: !parent.enabled
+                                        ? Theme.muted-text
+                                        : (search-touch.has-hover ? Theme.highlight-text : Theme.text);
+                                    width: 20px;
+                                    height: 20px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                search-touch := TouchArea {
+                                    enabled: parent.enabled;
+                                    mouse-cursor: parent.enabled ? MouseCursor.pointer : MouseCursor.default;
+                                    clicked => { root.do-search(); }
+                                }
+                                Tooltip { text: @markdown("Search TMDB"); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.hairline; }
+
+                        // Fields + poster columns.
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 12px;
+
+                            // Fields column.
+                            VerticalBox {
+                                horizontal-stretch: 1;
+                                padding: 0px;
+                                spacing: 6px;
+
+                                Text { text: "Fields"; font-size: 16px; font-weight: 700; }
+
+                                FieldRow {
+                                    label: "Title";
+                                    value <=> root.title-text;
+                                    locked <=> root.lock-title;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
+                                }
+
+                                // Video Kind + Lock + Fast-start.
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Video Kind";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.video-kind-options;
+                                        current-index <=> root.video-kind-index;
+                                        enabled: !root.lock-video-kind;
+                                        selected(idx) => { root.video-kind-changed(self.current-index); }
+                                    }
+                                    CheckBox { text: "Lock"; checked <=> root.lock-video-kind; }
+                                    CheckBox {
+                                        text: "Fast-start";
+                                        checked <=> root.fast-start;
+                                        toggled => { root.fast-start-changed(self.checked); }
+                                    }
+                                }
+
+                                // Definition (no lock) + detected dimensions.
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Definition";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.definition-options;
+                                        current-index <=> root.definition-index;
+                                        selected(idx) => { root.definition-changed(self.current-index); }
+                                    }
+                                    Text {
+                                        text: root.video-dimensions;
+                                        vertical-alignment: center;
+                                        min-width: 90px;
+                                    }
+                                }
+
+                                FieldRow {
+                                    label: "Release date (YYYY-MM-DD)";
+                                    value <=> root.year-text;
+                                    locked <=> root.lock-year;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
+                                }
+
+                                // Rating dropdown + Lock.
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Rating";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.rating-options;
+                                        current-index <=> root.rating-index;
+                                        enabled: !root.lock-rating;
+                                        selected(idx) => { root.rating-changed(self.current-index); }
+                                    }
+                                    CheckBox { text: "Lock"; checked <=> root.lock-rating; }
+                                }
+
+                                FieldRow {
+                                    label: "Genres (comma-sep)";
+                                    value <=> root.genres-text;
+                                    locked <=> root.lock-genres;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
+                                }
+                                PeopleRow {
+                                    label: "Directors (comma-sep)";
+                                    value <=> root.directors-text;
+                                    locked <=> root.lock-directors;
+                                    input-height: 72px;
+                                    edited => { root.field-edited(); }
+                                }
+                                PeopleRow {
+                                    label: "Cast (comma-sep)";
+                                    value <=> root.cast-text;
+                                    locked <=> root.lock-cast;
+                                    input-height: 72px;
+                                    edited => { root.field-edited(); }
+                                }
+                                PeopleRow {
+                                    label: "Producers (comma-sep)";
+                                    value <=> root.producers-text;
+                                    locked <=> root.lock-producers;
+                                    input-height: 72px;
+                                    edited => { root.field-edited(); }
+                                }
+                                PeopleRow {
+                                    label: "Screenwriters (comma-sep)";
+                                    value <=> root.writers-text;
+                                    locked <=> root.lock-writers;
+                                    input-height: 72px;
+                                    edited => { root.field-edited(); }
+                                }
+                                FieldRow {
+                                    label: "Studio";
+                                    value <=> root.studio-text;
+                                    locked <=> root.lock-studio;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
+                                }
+                                PeopleRow {
+                                    label: "Summary (max 255)";
+                                    value <=> root.summary-text;
+                                    locked <=> root.lock-summary;
+                                    input-height: 48px;
+                                    edited => { root.field-edited(); }
+                                }
+                                PeopleRow {
+                                    label: "Long Description";
+                                    value <=> root.overview-text;
+                                    locked <=> root.lock-overview;
+                                    input-height: 90px;
+                                    edited => { root.field-edited(); }
+                                }
+                            }
+
+                            // Current-poster column (fixed width, pinned right).
+                            VerticalBox {
+                                width: 170px;
+                                padding: 0px;
+                                spacing: 4px;
+                                alignment: start;
+
+                                Rectangle {
+                                    width: 150px;
+                                    height: 210px;
+                                    border-width: root.poster-selected ? 3px : 1px;
+                                    border-color: root.poster-selected ? Theme.highlight : Theme.border;
+                                    border-radius: 4px;
+                                    clip: true;
+
+                                    if root.has-cover: Image {
+                                        source: root.cover-image;
+                                        image-fit: contain;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+                                    if !root.has-cover: Text {
+                                        text: "(no poster in file)\npaste/drop to add";
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        wrap: word-wrap;
+                                    }
+
+                                    TouchArea {
+                                        clicked => { root.defocus-text(); root.poster-clicked(); }
+                                        double-clicked => { root.poster-double-clicked(); }
+                                    }
+                                }
+                                Text {
+                                    text: root.cover-size-caption;
+                                    horizontal-alignment: center;
+                                    width: 150px;
+                                }
+                                CheckBox {
+                                    text: "Lock";
+                                    checked <=> root.lock-poster;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.hairline; }
+
+                        Text { text: "Poster choices (TMDB)"; font-size: 16px; font-weight: 700; }
+                        Text { text: "Click to set as current poster · double-click to enlarge"; color: Theme.muted-text; }
+
+                        // Poster grid: a wrapping grid that fills the pane width
+                        // and lays out at its full height, so the outer editor
+                        // ScrollView scrolls it (a single scrollbar for the whole
+                        // editor). Thumbnails load lazily: we compute which rows
+                        // are inside the ScrollView's viewport by comparing the
+                        // grid's `absolute-position` (which moves as you scroll)
+                        // against the fixed viewport top/height, and report that
+                        // range to the controller.
+                        poster-grid := Rectangle {
+                            property <length> min-tile-w: 120px;
+                            property <length> tile-h: 180px;
+                            property <length> cap-h: 18px;   // size caption row
+                            property <length> gap: 8px;
+                            property <int> columns: max(1, floor((self.width + self.gap) / (self.min-tile-w + self.gap)));
+                            property <length> cell-w: (self.width - (self.columns - 1) * self.gap) / self.columns;
+                            property <length> cell-h: self.tile-h + self.cap-h;
+                            property <length> row-h: self.cell-h + self.gap;
+                            property <int> row-count: root.posters.length > 0
+                                ? (root.posters.length + self.columns - 1) / self.columns
+                                : 0;
+                            // Full content height so the outer ScrollView scrolls
+                            // the whole grid.
+                            height: self.row-count > 0 ? self.row-count * self.row-h - self.gap : 0px;
+
+                            // Grid top relative to the (fixed) viewport top. As
+                            // you scroll down, the grid moves up so this goes
+                            // negative; -offset-in-grid is how far the viewport
+                            // top has advanced into the grid.
+                            property <length> offset-into-grid: editor-scroll.absolute-position.y - self.absolute-position.y;
+                            property <length> viewport-h: editor-scroll.visible-height;
+                            // Inclusive visible row range, with one row of margin
+                            // each side to prefetch just off-screen.
+                            property <int> first-visible-row: max(0, floor((self.offset-into-grid - self.row-h) / self.row-h));
+                            property <int> last-visible-row: floor((self.offset-into-grid + self.viewport-h + self.row-h) / self.row-h);
+
+                            // Re-evaluate the visible range whenever the grid
+                            // scrolls (absolute-position changes), the viewport
+                            // resizes, or the layout (columns/rows) changes.
+                            changed first-visible-row => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed last-visible-row => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed columns => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed row-count => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+
+                            for poster[i] in root.posters: Rectangle {
+                                x: mod(i, poster-grid.columns) * (poster-grid.cell-w + poster-grid.gap);
+                                y: floor(i / poster-grid.columns) * poster-grid.row-h;
+                                width: poster-grid.cell-w;
+                                height: poster-grid.cell-h;
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    // Thumbnail with a selection highlight border.
+                                    Rectangle {
+                                        height: poster-grid.tile-h;
+                                        border-width: root.selected-poster-index == i ? 3px : 1px;
+                                        border-color: root.selected-poster-index == i ? Theme.highlight : Theme.border;
+                                        border-radius: 4px;
+                                        clip: true;
+                                        if poster.loaded: Image {
+                                            source: poster.image;
+                                            image-fit: contain;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                        if !poster.loaded: Text {
+                                            text: "…";
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    // Size caption (e.g. "500 x 750").
+                                    Text {
+                                        height: poster-grid.cap-h;
+                                        text: poster.size;
+                                        color: Theme.muted-text;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    clicked => { root.defocus-text(); root.poster-choice-clicked(i); }
+                                    double-clicked => { root.poster-choice-double-clicked(i); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Right: matches ---------------------------------------
+            VerticalBox {
+                width: 300px;
+                padding: 0px;
+                spacing: 6px;
+                Text { text: "Matches"; font-size: 16px; font-weight: 700; }
+                if root.matches.length == 0: Text {
+                    text: "No matches yet. Type a title and press search.";
+                    color: Theme.muted-text;
+                    wrap: word-wrap;
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for m[i] in root.matches: Rectangle {
+                        height: 34px;
+                        background: root.selected-match-index == i
+                            ? Theme.highlight
+                            : (touch.has-hover ? Theme.hover-row : transparent);
+                        touch := TouchArea {
+                            enabled: !root.loading-details;
+                            clicked => { root.select-match(i); }
+                        }
+                        HorizontalBox {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text {
+                                text: m.year == "" ? m.title : m.title + " (" + m.year + ")";
+                                color: root.selected-match-index == i ? Theme.highlight-text : Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Dialogs (overlays, rendered on top of the editor)
+    // =====================================================================
+
+    // ---- About ----------------------------------------------------------
+    if root.show-about: DialogScrim {
+        dismiss => { root.about-ok(); }
+        Rectangle {
+            width: 280px;
+            height: about-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            about-col := VerticalBox {
+                alignment: center;
+                spacing: 6px;
+                padding: 16px;
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
+                Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "©2026 Richard Lesh"; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "Built with Slint"; color: Theme.muted-text; horizontal-alignment: center; }
+                Hyperlink {
+                    text: "Glowing Cat Software";
+                    url: "https://glowingcat.com/TagTiger.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                Hyperlink {
+                    text: "Report issues on GitHub";
+                    url: "https://github.com/richlesh/TagTiger/issues";
+                    open-url(u) => { root.open-url(u); }
+                }
+                if root.about-licensed: Text {
+                    text: "Thank you for donating to\nGlowing Cat Software!";
+                    color: Theme.text;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "OK"; min-width: 90px; clicked => { root.about-ok(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Splash (startup / donation nag) --------------------------------
+    if root.show-splash: DialogScrim {
+        dismiss => { root.splash-dismiss(); }
+        Rectangle {
+            width: 280px;
+            height: splash-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            splash-col := VerticalBox {
+                alignment: center;
+                spacing: 6px;
+                padding: 16px;
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
+                Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Text {
+                        text: "If you enjoy using this product please consider donating to help fund this and other open source projects.";
+                        color: Theme.text;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        max-width: 200px;
+                    }
+                }
+                Hyperlink {
+                    text: "Donate at Glowing Cat Software";
+                    url: "https://glowingcat.com/TagTiger.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "OK"; min-width: 90px; clicked => { root.splash-dismiss(); } }
+                }
+            }
+        }
+    }
+
+    // ---- License Key ----------------------------------------------------
+    if root.show-license: DialogScrim {
+        dismiss => { root.license-cancel(); }
+        Rectangle {
+            width: 360px;
+            height: lic-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            lic-col := VerticalBox {
+                alignment: start;
+                spacing: 8px;
+                padding: 16px;
+                Text { text: "License Key"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Enter your email address and license key"; color: Theme.muted-text; horizontal-alignment: center; wrap: word-wrap; }
+                LineEdit {
+                    placeholder-text: "Your email address";
+                    text <=> root.license-email;
+                    edited => { root.license-key-edited(); }
+                }
+                LineEdit {
+                    placeholder-text: "XXXX-XXXX-XXXX-XXXX";
+                    text <=> root.license-key;
+                    edited => { root.license-key-edited(); }
+                    accepted => { if root.license-valid { root.license-save(); } }
+                }
+                Hyperlink {
+                    text: "Donate at Glowing Cat Software to get a license key.";
+                    url: "https://glowingcat.com/TagTiger.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                if root.license-msg != "": Text { text: root.license-msg; color: Theme.error-text; wrap: word-wrap; }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.license-cancel(); } }
+                    Button { text: "Save"; enabled: root.license-valid; clicked => { root.license-save(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Settings -------------------------------------------------------
+    if root.show-settings: DialogScrim {
+        dismiss => { root.settings-cancel(); }
+        Rectangle {
+            width: 400px;
+            height: set-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            set-col := VerticalBox {
+                alignment: start;
+                spacing: 8px;
+                padding: 16px;
+                Text { text: "Settings"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "Theme"; color: Theme.text; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: ["Light", "Dark"];
+                        current-index <=> root.settings-theme-index;
+                        // Apply live so the user sees the change immediately.
+                        selected(v) => { root.theme-changed(self.current-index); }
+                    }
+                }
+                Text { text: "TMDB Bearer Token"; color: Theme.text; }
+                LineEdit {
+                    placeholder-text: "Paste your v4 read access token";
+                    input-type: password;
+                    text <=> root.settings-token;
+                    accepted => { root.settings-save(); }
+                }
+                Hyperlink {
+                    text: "To get a TMDB API Read Access Token…";
+                    url: "https://www.themoviedb.org/settings/api";
+                    open-url(u) => { root.open-url(u); }
+                }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.settings-cancel(); } }
+                    Button { text: "Save"; clicked => { root.settings-save(); } }
+                }
+            }
+        }
+    }
+
+    // ---- No TMDB credential --------------------------------------------
+    if root.show-no-credential: DialogScrim {
+        dismiss => { root.no-cred-ok(); }
+        Rectangle {
+            width: 400px;
+            height: nc-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            nc-col := VerticalBox {
+                alignment: start;
+                spacing: 8px;
+                padding: 16px;
+                Text { text: "TMDB credential required"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                Text {
+                    text: "A TMDB account and API Read Access Token are required for TMDB searches. Configure your token in the Settings dialog.";
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+                Hyperlink {
+                    text: "To get a TMDB API Read Access Token…";
+                    url: "https://www.themoviedb.org/settings/api";
+                    open-url(u) => { root.open-url(u); }
+                }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "OK"; clicked => { root.no-cred-ok(); } }
+                    Button { text: "Open Settings…"; clicked => { root.no-cred-open-settings(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Save progress --------------------------------------------------
+    // Save progress is shown inline in the top status panel (no dialog).
+
+    // ---- Save complete --------------------------------------------------
+    if root.show-complete: DialogScrim {
+        dismiss => { root.complete-ok(); }
+        Rectangle {
+            width: 360px;
+            height: comp-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            comp-col := VerticalBox {
+                alignment: start;
+                spacing: 12px;
+                padding: 16px;
+                Text { text: "Update complete"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: root.complete-msg; color: Theme.text; wrap: word-wrap; horizontal-alignment: center; }
+                Button { text: "OK"; clicked => { root.complete-ok(); } }
+            }
+        }
+    }
+
+    // ---- Lightbox (enlarged poster) ------------------------------------
+    if root.show-lightbox: DialogScrim {
+        dismiss => { root.lightbox-close(); }
+        Rectangle {
+            width: min(root.width - 80px, 800px);
+            height: min(root.height - 80px, 800px);
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalBox {
+                padding: 12px;
+                if root.lightbox-loaded: Image {
+                    source: root.lightbox-image;
+                    image-fit: contain;
+                }
+                if !root.lightbox-loaded: Text {
+                    text: "Loading…";
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

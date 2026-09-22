@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "egui desktop frontend for TagTiger"
+description = "Slint desktop frontend for TagTiger"
 
 [[bin]]
 name = "tagtiger-gui"
@@ -20,7 +20,7 @@ reqwest.workspace = true
 rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-eframe = "0.36"
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
 rfd = "0.17"
 image.workspace = true
 chrono.workspace = true
@@ -36,18 +36,35 @@ serde_json.workspace = true
 # objc2 to avoid a second, incompatible objc2 in the graph.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5.2"
-objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSArray", "NSURL", "NSData"] }
-objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSArray", "NSURL", "NSData", "NSGeometry"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSResponder", "NSDragging", "NSMenu", "NSMenuItem", "NSApplication", "NSColor", "NSColorSpace"] }
+# Obtain the NSView from the Slint window for native file drag-and-drop.
+raw-window-handle = "0.6"
+
+# Windows: read the user's accent / highlight colors (DWM + system colors) so
+# the app's highlights and progress bar match the OS. Version matches Slint's
+# winit backend to avoid a duplicate `windows` crate in the graph.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Foundation"] }
+
+# Linux: read the XDG desktop-portal accent color over D-Bus. Version matches
+# Slint's winit backend.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.14", default-features = false, features = ["async-io", "blocking-api"] }
 
 # Windows: embed the .ico into the executable at build time.
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
+# Compile the .slint UI files into Rust at build time.
+[build-dependencies]
+slint-build = "1.18"
+
 # Package metadata for cargo-deb / cargo-generate-rpm (Linux installers).
 [package.metadata.deb]
 section = "video"
 priority = "optional"
-depends = "libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libgl1"
+depends = "libc6, libgcc-s1, libfontconfig1, libx11-6, libx11-xcb1, libxcb1, libxkbcommon0, libgl1"
 assets = [
     ["target/release/tagtiger-gui", "usr/bin/", "755"],
     ["target/release/tagtiger", "usr/bin/", "755"],
@@ -63,5 +80,7 @@ assets = [
     { source = "src/resources/app_icon_256.png", dest = "/usr/share/icons/hicolor/256x256/apps/tagtiger.png", mode = "644" },
 ]
 [package.metadata.generate-rpm.requires]
+fontconfig = "*"
 libX11 = "*"
+libxkbcommon = "*"
 mesa-libGL = "*"

@@ -1,5 +1,5 @@
 //! Background worker: runs a tokio runtime on its own thread and services
-//! requests from the (single-threaded) egui UI. The UI sends [`Request`]s and
+//! requests from the (single-threaded) UI. The UI sends [`Request`]s and
 //! receives [`Event`]s without ever blocking on network or disk.
 
 use std::path::PathBuf;
@@ -12,6 +12,12 @@ use tagtiger_core::{
 };
 
 /// Requests the UI sends to the worker.
+//
+// The worker integration test includes this file standalone via `#[path]`, so
+// from that compilation unit's view the variants constructed only by the
+// controller (app.rs) look "never constructed". They're fully used in the
+// binary; allow dead_code so `-D warnings` doesn't trip on the test build.
+#[allow(dead_code)]
 pub enum Request {
     /// Open a native file picker (async, off the UI thread) and load the
     /// existing tags + cover art from the chosen file.
@@ -41,6 +47,11 @@ pub enum Request {
     SetCoverFromUrl {
         url: String,
     },
+    /// Download a poster (e.g. a selected TMDB grid poster) and hand its bytes
+    /// back so the UI thread can place it on the system clipboard.
+    CopyPosterToClipboard {
+        url: String,
+    },
     WriteTags {
         file: PathBuf,
         meta: Box<MediaMetadata>,
@@ -59,6 +70,9 @@ pub enum Request {
 }
 
 /// Events the worker sends back to the UI.
+// See the note on `Request`: the integration test includes this file
+// standalone, so variants/fields consumed only by the controller look unused.
+#[allow(dead_code)]
 pub enum Event {
     /// A file was opened: its existing metadata, an optional decoded cover
     /// thumbnail (rgba), and a suggested search string (existing title or the
@@ -104,13 +118,18 @@ pub enum Event {
         orig_size: (u32, u32),
         bytes: Vec<u8>,
     },
+    /// Raw poster bytes to place on the system clipboard (UI thread does the
+    /// actual clipboard write). Used by the grid-poster Copy action.
+    CopyToClipboard {
+        bytes: Vec<u8>,
+    },
     WriteDone {
         file: PathBuf,
     },
     /// A shift-save started (streaming media to a temp file).
     WriteStarted,
-    /// Progress of a shift-save: (bytes_done, bytes_total).
-    WriteProgress(u64, u64),
+    /// Progress of a shift-save: (phase_label, bytes_done, bytes_total).
+    WriteProgress(&'static str, u64, u64),
     Error(String),
 }
 
@@ -120,9 +139,9 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Spawn the worker thread. `repaint` is called after each event so egui
-    /// wakes up to process it. `initial_token` is the saved TMDB Bearer token
-    /// from settings (empty to fall back to the environment).
+    /// Spawn the worker thread. `repaint` is called after each event to wake
+    /// the UI event loop so it processes the event. `initial_token` is the
+    /// saved TMDB Bearer token from settings (empty to fall back to the env).
     pub fn spawn(initial_token: String, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Event>();
@@ -193,7 +212,7 @@ async fn handle(
         Request::PickFile => {
             // Async dialog runs off the UI thread, avoiding the nested-native-
             // run-loop panic that occurs when a blocking rfd dialog is called
-            // from inside an eframe/winit frame on macOS.
+            // from inside the UI's event loop on macOS.
             let picked = rfd::AsyncFileDialog::new()
                 .add_filter("MP4/M4V", &["mp4", "m4v"])
                 .pick_file()
@@ -266,6 +285,10 @@ async fn handle(
                 bytes,
             }))
         }
+        Request::CopyPosterToClipboard { url } => {
+            let bytes = artwork::download(&client, &url).await?;
+            Ok(Some(Event::CopyToClipboard { bytes }))
+        }
         Request::WriteTags {
             file,
             meta,
@@ -286,12 +309,12 @@ async fn handle(
             // A shift save streams the media with progress; an in-place save
             // never calls the progress callback. Announce a start only once.
             let mut announced = false;
-            let mut on_progress = |done: u64, total: u64| {
+            let mut on_progress = |phase: tag::WritePhase, done: u64, total: u64| {
                 if !announced {
                     announced = true;
                     let _ = evt_tx.send(Event::WriteStarted);
                 }
-                let _ = evt_tx.send(Event::WriteProgress(done, total));
+                let _ = evt_tx.send(Event::WriteProgress(phase.label(), done, total));
                 repaint();
             };
             tag::write_to_file_with_progress(

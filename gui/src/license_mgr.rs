@@ -86,6 +86,15 @@ pub struct Settings {
     /// the `TMDB_BEARER_TOKEN` / `TMDB_API_KEY` environment variables.
     #[serde(default)]
     pub tmdb_bearer_token: String,
+    /// UI theme: "Light" or "Dark". Defaults to Dark (see `default_theme`) so
+    /// existing settings files without this field keep the original look.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+/// Default theme when none is stored: Dark (the app's original appearance).
+fn default_theme() -> String {
+    "Dark".to_string()
 }
 
 impl Settings {
@@ -114,6 +123,12 @@ impl Settings {
     /// Whether the saved license is currently valid.
     pub fn is_licensed(&self) -> bool {
         is_valid(&self.license_key, &self.license_email)
+    }
+
+    /// Whether the UI theme is Dark. Treats any value other than "Light" as
+    /// Dark, so a missing/empty field (older settings, `Default`) is Dark.
+    pub fn theme_is_dark(&self) -> bool {
+        !self.theme.eq_ignore_ascii_case("Light")
     }
 }
 
@@ -159,5 +174,22 @@ mod tests {
     fn format_key_groups_in_fours() {
         assert_eq!(format_key("ABCDEF0123456789"), "ABCD-EF01-2345-6789");
         assert_eq!(format_key("abcd1234"), "ABCD-1234");
+    }
+
+    #[test]
+    fn theme_defaults_to_dark_and_is_backward_compatible() {
+        // A settings file predating the theme field deserializes to Dark.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.theme, "Dark");
+        assert!(s.theme_is_dark());
+
+        // Explicit values are honored (case-insensitive).
+        let light: Settings = serde_json::from_str(r#"{"theme":"Light"}"#).unwrap();
+        assert!(!light.theme_is_dark());
+        let dark: Settings = serde_json::from_str(r#"{"theme":"Dark"}"#).unwrap();
+        assert!(dark.theme_is_dark());
+
+        // Default::default() has an empty theme, which counts as Dark.
+        assert!(Settings::default().theme_is_dark());
     }
 }

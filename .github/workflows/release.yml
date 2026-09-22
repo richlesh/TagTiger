@@ -1,12 +1,12 @@
 name: Release
 
 on:
-  # Manual release: provide the version (e.g. 1.0.0 or v1.0.0). The tag is
+  # Manual release: provide the version (e.g. 1.1.0). The tag is
   # created and pushed by the workflow if it doesn't already exist.
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 1.0.0 or v1.0.0)"
+        description: "Release version (e.g. 1.1.0)"
         required: true
   # Also still runs when a matching tag is pushed directly.
   push:
@@ -115,8 +115,9 @@ jobs:
         if: matrix.os == 'ubuntu-22.04' && matrix.cross == false
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
-            libxi-dev libgl1-mesa-dev libxkbcommon-dev
+          sudo apt-get install -y build-essential libfontconfig-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxkbcommon-dev
 
       # For aarch64 Linux we use `cross`, which builds inside a container that
       # carries the correct cross sysroot and GUI libs.
