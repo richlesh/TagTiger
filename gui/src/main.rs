@@ -10,6 +10,8 @@
 mod app;
 mod license;
 mod license_mgr;
+#[cfg(target_os = "linux")]
+mod linux_theme;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 #[cfg(target_os = "macos")]
@@ -19,8 +21,6 @@ mod macos_theme;
 mod sys_colors;
 #[cfg(target_os = "windows")]
 mod win_theme;
-#[cfg(target_os = "linux")]
-mod linux_theme;
 mod worker;
 
 fn main() -> Result<(), slint::PlatformError> {

@@ -297,7 +297,6 @@ pub struct MediaQuery {
     pub episode: Option<u32>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{Definition, Definition::*};

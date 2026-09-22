@@ -13,10 +13,10 @@
 
 use crate::sys_colors::{Rgb, SystemColors};
 
+use zbus::zvariant::{OwnedValue, Value};
+
 /// Read the accent color from the XDG settings portal (one-shot, blocking).
 fn read_accent() -> Option<Rgb> {
-    use zbus::zvariant::{OwnedValue, Value};
-
     // A short-lived blocking zbus connection to the session bus. `zbus` is
     // already in the dependency graph via Slint's winit backend on Linux.
     let conn = zbus::blocking::Connection::session().ok()?;
@@ -43,25 +43,30 @@ fn read_accent() -> Option<Rgb> {
         return None;
     }
     let q = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Some(Rgb { r: q(r), g: q(g), b: q(b) })
+    Some(Rgb {
+        r: q(r),
+        g: q(g),
+        b: q(b),
+    })
+}
 
-    // Unwrap a `(ddd)` RGB tuple from a portal reply, peeling any nested
-    // variant wrappers (Read wraps one extra `v` compared to ReadOne).
-    fn tuple_from_value(value: OwnedValue) -> Option<(f64, f64, f64)> {
-        // Try the direct tuple conversion first.
-        if let Ok(t) = <(f64, f64, f64)>::try_from(value.clone()) {
-            return Some(t);
-        }
-        // Otherwise unwrap one variant layer and retry.
-        let inner: Value = value.into();
-        if let Value::Value(boxed) = inner {
-            let owned = OwnedValue::try_from(*boxed).ok()?;
+/// Unwrap a `(ddd)` RGB tuple from a portal reply, peeling any nested variant
+/// wrappers (Read wraps one extra `v` compared to ReadOne).
+fn tuple_from_value(value: OwnedValue) -> Option<(f64, f64, f64)> {
+    // Try the direct tuple conversion first.
+    if let Ok(t) = <(f64, f64, f64)>::try_from(value.clone()) {
+        return Some(t);
+    }
+    // Otherwise unwrap one variant layer and retry.
+    let inner: Value = value.into();
+    if let Value::Value(boxed) = inner {
+        if let Ok(owned) = OwnedValue::try_from(*boxed) {
             if let Ok(t) = <(f64, f64, f64)>::try_from(owned) {
                 return Some(t);
             }
         }
-        None
     }
+    None
 }
 
 /// Read the current OS accent color. Highlight uses the accent; the text color

@@ -12,9 +12,7 @@
 use crate::sys_colors::{Rgb, SystemColors};
 
 use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
-use windows::Win32::Graphics::Gdi::{
-    GetSysColor, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
-};
+use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT};
 
 /// Decode a Win32 `COLORREF` (0x00BBGGRR) into RGB.
 fn sys_color(index: windows::Win32::Graphics::Gdi::SYS_COLOR_INDEX) -> Rgb {

@@ -25,7 +25,11 @@ fn to_rgb(color: &NSColor) -> Option<Rgb> {
         let g = c.greenComponent();
         let b = c.blueComponent();
         let q = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        Some(Rgb { r: q(r), g: q(g), b: q(b) })
+        Some(Rgb {
+            r: q(r),
+            g: q(g),
+            b: q(b),
+        })
     }
 }
 

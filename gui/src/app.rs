@@ -1129,8 +1129,9 @@ fn set_cover_bytes(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, bytes: Option
 fn apply_system_colors(w: &MainWindow) {
     if let Some(c) = crate::sys_colors::system_colors() {
         let theme = w.global::<Theme>();
-        let col =
-            |c: crate::sys_colors::Rgb| slint::Brush::SolidColor(slint::Color::from_rgb_u8(c.r, c.g, c.b));
+        let col = |c: crate::sys_colors::Rgb| {
+            slint::Brush::SolidColor(slint::Color::from_rgb_u8(c.r, c.g, c.b))
+        };
         theme.set_sys_highlight(col(c.highlight));
         theme.set_sys_highlight_text(col(c.highlight_text));
         theme.set_sys_accent(col(c.accent));
@@ -1213,7 +1214,11 @@ fn copy_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 fn cut_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let (has, locked, bytes) = {
         let c = ctrl.borrow();
-        (c.cover_bytes.is_some(), w.get_lock_poster(), c.cover_bytes.clone())
+        (
+            c.cover_bytes.is_some(),
+            w.get_lock_poster(),
+            c.cover_bytes.clone(),
+        )
     };
     if !has {
         w.set_status(SharedString::from("No poster to cut."));
@@ -1288,7 +1293,12 @@ fn poster_choice_clicked(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i3
 /// Populate the editable properties from `meta`. When `respect_locks` is true
 /// (a new match's details), locked fields are left untouched; when false
 /// (initial file load) all fields are set.
-fn load_meta(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, meta: MediaMetadata, respect_locks: bool) {
+fn load_meta(
+    ctrl: &Rc<RefCell<Controller>>,
+    w: &MainWindow,
+    meta: MediaMetadata,
+    respect_locks: bool,
+) {
     if !(respect_locks && w.get_lock_title()) {
         w.set_title_text(SharedString::from(meta.title.clone()));
     }
@@ -1315,7 +1325,9 @@ fn load_meta(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, meta: MediaMetadata
         w.set_summary_text(SharedString::from(meta.summary.clone().unwrap_or_default()));
     }
     if !(respect_locks && w.get_lock_overview()) {
-        w.set_overview_text(SharedString::from(meta.overview.clone().unwrap_or_default()));
+        w.set_overview_text(SharedString::from(
+            meta.overview.clone().unwrap_or_default(),
+        ));
     }
     if !(respect_locks && w.get_lock_genres()) {
         w.set_genres_text(SharedString::from(meta.genres.join(", ")));
@@ -1396,7 +1408,12 @@ fn visible_index_range(
 /// `[first_row, last_row]` (with `columns` per row) that haven't been requested
 /// yet. Called from the `poster-rows-visible` callback as the user scrolls, and
 /// once when a match's posters first load.
-fn request_visible_thumbs(ctrl: &Rc<RefCell<Controller>>, first_row: i32, last_row: i32, columns: i32) {
+fn request_visible_thumbs(
+    ctrl: &Rc<RefCell<Controller>>,
+    first_row: i32,
+    last_row: i32,
+    columns: i32,
+) {
     let mut to_fetch: Vec<(usize, String)> = Vec::new();
     {
         let mut c = ctrl.borrow_mut();
@@ -1438,8 +1455,7 @@ fn collect_edited(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) -> Option<Medi
     m.title = w.get_title_text().to_string();
     m.video_kind = index_to_video_kind(w.get_video_kind_index());
     m.definition = index_to_definition(w.get_definition_index());
-    m.release_date =
-        chrono::NaiveDate::parse_from_str(w.get_year_text().trim(), "%Y-%m-%d").ok();
+    m.release_date = chrono::NaiveDate::parse_from_str(w.get_year_text().trim(), "%Y-%m-%d").ok();
     let rating = index_to_rating(w.get_rating_index());
     m.content_rating = if rating.trim().is_empty() {
         None
@@ -1536,7 +1552,10 @@ fn license_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let (token, dark) = {
         let c = ctrl.borrow();
-        (c.settings.tmdb_bearer_token.clone(), c.settings.theme_is_dark())
+        (
+            c.settings.tmdb_bearer_token.clone(),
+            c.settings.theme_is_dark(),
+        )
     };
     w.set_settings_token(SharedString::from(token));
     // Reflect the current theme in the selector; remember it so Cancel can
@@ -1595,8 +1614,7 @@ fn open_tmdb_lightbox(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) 
             .as_ref()
             .and_then(|m| m.artwork.get(index))
             .map(|a| a.url.clone());
-        let needs_fetch = cached.is_none()
-            && !c.full_requested.get(index).copied().unwrap_or(true);
+        let needs_fetch = cached.is_none() && !c.full_requested.get(index).copied().unwrap_or(true);
         (cached, url, needs_fetch)
     };
     ctrl.borrow_mut().lightbox = Some(Lightbox::Tmdb(index));
@@ -1654,7 +1672,10 @@ fn load_app_icon() -> Option<slint::Image> {
 fn webbrowser_open(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn().map(|_| ())
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {

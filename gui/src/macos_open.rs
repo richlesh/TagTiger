@@ -182,13 +182,19 @@ const NS_DRAG_OPERATION_COPY: usize = 1;
 
 fn ext_is_movie(path: &std::path::Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("mp4") | Some("m4v")
     )
 }
 fn ext_is_image(path: &std::path::Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") | Some("webp")
     )
 }
@@ -205,8 +211,7 @@ unsafe fn handle_drop(sender: &AnyObject) -> bool {
         return false;
     }
     // let list = [pb propertyListForType: NSFilenamesPboardType]; -> NSArray<NSString>
-    let list: *mut NSArray<NSString> =
-        msg_send![pb, propertyListForType: &**NSFilenamesPboardType];
+    let list: *mut NSArray<NSString> = msg_send![pb, propertyListForType: &**NSFilenamesPboardType];
     if list.is_null() {
         return false;
     }
