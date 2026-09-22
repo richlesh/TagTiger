@@ -1148,48 +1148,31 @@ fn update_undo_redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 // Poster clipboard / grid
 // ---------------------------------------------------------------------------
 
-/// Dispatch a synthetic Ctrl/Cmd + `key` shortcut to the window so the focused
-/// TextInput performs the corresponding standard text op (Slint maps Cmd→control
-/// on macOS internally, so `Control` is correct on every platform). Used to
-/// route the Edit-menu Cut/Copy/Paste to the focused field.
-fn dispatch_text_shortcut(w: &MainWindow, key: char) {
-    use slint::platform::{Key, WindowEvent};
-    let win = w.window();
-    win.dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
-    win.dispatch_event(WindowEvent::KeyPressed { text: SharedString::from(key.to_string()) });
-    win.dispatch_event(WindowEvent::KeyReleased { text: SharedString::from(key.to_string()) });
-    win.dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
-}
-
-/// Route Cut to the focused text field, else the selected current poster.
+/// Route Cut to the selected current poster. (These handlers only fire for
+/// poster selections — the Edit items are disabled while a text field is
+/// focused, so the field handles Cmd/Ctrl+X natively; see ClipCtx.)
 fn do_cut(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let clip = w.global::<ClipCtx>();
-    if clip.get_text_focused() {
-        dispatch_text_shortcut(w, 'x');
-    } else if clip.get_current_poster() {
+    if clip.get_current_poster() {
         cut_poster(ctrl, w);
     }
 }
 
-/// Route Copy to the focused text field, the selected current poster, or a
-/// selected TMDB grid poster (grid → copy that poster's image).
+/// Route Copy to the selected current poster, or a selected TMDB grid poster
+/// (grid → copy that poster's image).
 fn do_copy(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let clip = w.global::<ClipCtx>();
-    if clip.get_text_focused() {
-        dispatch_text_shortcut(w, 'c');
-    } else if clip.get_current_poster() {
+    if clip.get_current_poster() {
         copy_poster(ctrl, w);
     } else if clip.get_grid_poster() {
         copy_grid_poster(ctrl, w);
     }
 }
 
-/// Route Paste to the focused text field, else the selected current poster.
+/// Route Paste to the selected current poster.
 fn do_paste(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let clip = w.global::<ClipCtx>();
-    if clip.get_text_focused() {
-        dispatch_text_shortcut(w, 'v');
-    } else if clip.get_current_poster() {
+    if clip.get_current_poster() {
         paste_poster(ctrl, w);
     }
 }

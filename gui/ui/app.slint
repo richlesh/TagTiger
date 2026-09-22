@@ -75,16 +75,21 @@ export global ClipCtx {
     in property <bool> poster-locked: false;
     in property <bool> current-poster-has-image: false;
 
+    // Menu Cut/Copy/Paste enablement. IMPORTANT: these deliberately do NOT
+    // include `text-focused`. A menubar `shortcut:` is matched by Slint *before*
+    // the key reaches the focused item AND only for *enabled* items, so if these
+    // were enabled while a text field is focused, the Cut/Copy/Paste
+    // accelerators (Cmd/Ctrl+X/C/V) would be intercepted and the focused
+    // TextInput would never perform its own native cut/copy/paste. By enabling
+    // the menu items only for poster selections, a focused field handles the
+    // shortcuts natively, while the menu items (and their accelerators) act on
+    // the selected poster when no field is focused.
     out property <bool> can-cut:
-        root.text-focused
-        || (root.current-poster && root.current-poster-has-image && !root.poster-locked);
+        root.current-poster && root.current-poster-has-image && !root.poster-locked;
     out property <bool> can-copy:
-        root.text-focused
-        || (root.current-poster && root.current-poster-has-image)
-        || root.grid-poster;
+        (root.current-poster && root.current-poster-has-image) || root.grid-poster;
     out property <bool> can-paste:
-        root.text-focused
-        || (root.current-poster && !root.poster-locked);
+        root.current-poster && !root.poster-locked;
 }
 
 // One TMDB search result shown in the Matches list.
@@ -616,31 +621,33 @@ export component MainWindow inherits Window {
                 activated => { root.do-redo(); }
             }
             MenuSeparator {}
-            // Cut/Copy/Paste are context-sensitive (see ClipCtx + the do-cut/
-            // do-copy/do-paste routers): they act on the focused text field's
-            // selection, the selected current poster, or (Copy only) a selected
-            // TMDB grid poster.
+            // Cut/Copy/Paste act on the selected poster (current cover, or a TMDB
+            // grid poster for Copy). They carry Cmd/Ctrl+X/C/V accelerators.
             //
-            // NOTE: no `shortcut:` here on purpose. A menubar shortcut is matched
-            // by Slint *before* the key event reaches the focused item, so
-            // declaring Ctrl/Cmd+X/C/V would intercept the keystroke and prevent
-            // the focused TextInput from performing its own native cut/copy/paste
-            // (the field would never receive the key). Native text shortcuts work
-            // out of the box; the menu items (via click) still route correctly to
-            // the field or the selected poster.
+            // These items are enabled ONLY for poster selections (see
+            // ClipCtx.can-*, which excludes text focus). That is deliberate: a
+            // menubar `shortcut:` is matched by Slint before the key reaches the
+            // focused item, and only for *enabled* items. So while a text field
+            // is focused these items are disabled → their accelerators don't
+            // register → the focused TextInput handles Cmd/Ctrl+X/C/V natively.
+            // When a poster is selected the items enable and the accelerators act
+            // on the poster.
             MenuItem {
                 title: "Cut";
                 enabled: ClipCtx.can-cut;
+                shortcut: @keys(Control + X);
                 activated => { root.do-cut(); }
             }
             MenuItem {
                 title: "Copy";
                 enabled: ClipCtx.can-copy;
+                shortcut: @keys(Control + C);
                 activated => { root.do-copy(); }
             }
             MenuItem {
                 title: "Paste";
                 enabled: ClipCtx.can-paste;
+                shortcut: @keys(Control + V);
                 activated => { root.do-paste(); }
             }
         }
