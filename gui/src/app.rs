@@ -217,6 +217,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     window.set_theme_dark(dark);
     window.set_settings_theme_index(if dark { 1 } else { 0 });
 
+    // Match the app's highlight/accent colors to the user's OS setting (macOS:
+    // the chosen accent + selection colors). Falls back to Slint's Palette
+    // defaults when unavailable.
+    apply_system_colors(&window);
+
     wire_callbacks(&window, &ctrl);
 
     // Startup splash for unlicensed users (auto-dismisses after 20s via a
@@ -472,7 +477,7 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         let handle = window.as_weak();
         window.on_do_cut(move || {
             if let Some(w) = handle.upgrade() {
-                cut_poster(&ctrl, &w);
+                do_cut(&ctrl, &w);
             }
         });
     }
@@ -481,7 +486,7 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         let handle = window.as_weak();
         window.on_do_copy(move || {
             if let Some(w) = handle.upgrade() {
-                copy_poster(&ctrl, &w);
+                do_copy(&ctrl, &w);
             }
         });
     }
@@ -490,7 +495,7 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         let handle = window.as_weak();
         window.on_do_paste(move || {
             if let Some(w) = handle.upgrade() {
-                paste_poster(&ctrl, &w);
+                do_paste(&ctrl, &w);
             }
         });
     }
@@ -587,6 +592,21 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
             }
         });
     }
+    {
+        // A text field gained focus: drop any poster selection so clipboard
+        // focus (and the highlight) moves to the field.
+        let handle = window.as_weak();
+        window.on_clear_poster_selection(move || {
+            if let Some(w) = handle.upgrade() {
+                if w.get_poster_selected() {
+                    w.set_poster_selected(false);
+                }
+                if w.get_selected_poster_index() >= 0 {
+                    w.set_selected_poster_index(-1);
+                }
+            }
+        });
+    }
     window.on_poster_double_clicked({
         let ctrl = ctrl.clone();
         let handle = window.as_weak();
@@ -643,11 +663,14 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     // launch argument. Drained here since this runs on the UI thread every tick.
     #[cfg(target_os = "macos")]
     {
-        // Keep the native app-menu "About" pointed at our dialog (muda rebuilds
-        // the menu on property changes), and pick up clicks on it.
-        crate::macos_menu::enforce_about_override();
+        // Keep the native app-menu customizations in place (muda rebuilds the
+        // menu on property changes): About -> our dialog, plus a Settings item.
+        crate::macos_menu::enforce_app_menu();
         if crate::macos_menu::take_about_requested() {
             w.set_show_about(true);
+        }
+        if crate::macos_menu::take_settings_requested() {
+            open_settings_dialog(ctrl, w);
         }
         for path in crate::macos_open::take_pending() {
             if is_movie_path(&path) && path.exists() {
@@ -749,6 +772,14 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 w.set_cover_size_caption(SharedString::from(size_caption(Some(orig_size))));
                 w.set_status(SharedString::from("Poster set as current."));
                 update_undo_redo(ctrl, w);
+            }
+            Event::CopyToClipboard { bytes } => {
+                let msg = if write_clipboard_image(&bytes).is_ok() {
+                    "Poster copied to clipboard."
+                } else {
+                    "Failed to copy poster."
+                };
+                w.set_status(SharedString::from(msg));
             }
             Event::SearchDone { results } => {
                 {
@@ -1091,6 +1122,22 @@ fn set_cover_bytes(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, bytes: Option
     ctrl.borrow_mut().cover_bytes = bytes;
 }
 
+/// Push the OS accent / selection colors into the `Theme` global so the app's
+/// highlights and progress bar match the user's chosen OS colors. Falls back to
+/// Slint's Palette defaults (`has-sys-colors` false) when the OS colors can't
+/// be read (e.g. a Linux desktop without an accent-color portal setting).
+fn apply_system_colors(w: &MainWindow) {
+    if let Some(c) = crate::sys_colors::system_colors() {
+        let theme = w.global::<Theme>();
+        let col =
+            |c: crate::sys_colors::Rgb| slint::Brush::SolidColor(slint::Color::from_rgb_u8(c.r, c.g, c.b));
+        theme.set_sys_highlight(col(c.highlight));
+        theme.set_sys_highlight_text(col(c.highlight_text));
+        theme.set_sys_accent(col(c.accent));
+        theme.set_has_sys_colors(true);
+    }
+}
+
 fn update_undo_redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let c = ctrl.borrow();
     w.set_can_undo(!c.undo_stack.is_empty() || c.text_edit_pending.is_some());
@@ -1100,6 +1147,75 @@ fn update_undo_redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 // ---------------------------------------------------------------------------
 // Poster clipboard / grid
 // ---------------------------------------------------------------------------
+
+/// Dispatch a synthetic Ctrl/Cmd + `key` shortcut to the window so the focused
+/// TextInput performs the corresponding standard text op (Slint maps Cmd→control
+/// on macOS internally, so `Control` is correct on every platform). Used to
+/// route the Edit-menu Cut/Copy/Paste to the focused field.
+fn dispatch_text_shortcut(w: &MainWindow, key: char) {
+    use slint::platform::{Key, WindowEvent};
+    let win = w.window();
+    win.dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+    win.dispatch_event(WindowEvent::KeyPressed { text: SharedString::from(key.to_string()) });
+    win.dispatch_event(WindowEvent::KeyReleased { text: SharedString::from(key.to_string()) });
+    win.dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+}
+
+/// Route Cut to the focused text field, else the selected current poster.
+fn do_cut(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let clip = w.global::<ClipCtx>();
+    if clip.get_text_focused() {
+        dispatch_text_shortcut(w, 'x');
+    } else if clip.get_current_poster() {
+        cut_poster(ctrl, w);
+    }
+}
+
+/// Route Copy to the focused text field, the selected current poster, or a
+/// selected TMDB grid poster (grid → copy that poster's image).
+fn do_copy(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let clip = w.global::<ClipCtx>();
+    if clip.get_text_focused() {
+        dispatch_text_shortcut(w, 'c');
+    } else if clip.get_current_poster() {
+        copy_poster(ctrl, w);
+    } else if clip.get_grid_poster() {
+        copy_grid_poster(ctrl, w);
+    }
+}
+
+/// Route Paste to the focused text field, else the selected current poster.
+fn do_paste(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let clip = w.global::<ClipCtx>();
+    if clip.get_text_focused() {
+        dispatch_text_shortcut(w, 'v');
+    } else if clip.get_current_poster() {
+        paste_poster(ctrl, w);
+    }
+}
+
+/// Copy the currently selected TMDB grid poster's image to the clipboard.
+fn copy_grid_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let idx = w.get_selected_poster_index();
+    if idx < 0 {
+        return;
+    }
+    // Prefer an already-fetched full image's bytes; fall back to the thumbnail
+    // source is not byte-addressable, so we re-use the cover pipeline by asking
+    // the worker to download the poster URL and place it on the clipboard.
+    let url = {
+        let c = ctrl.borrow();
+        c.meta
+            .as_ref()
+            .and_then(|m| m.artwork.get(idx as usize))
+            .map(|a| a.url.clone())
+    };
+    if let Some(url) = url {
+        w.set_status(SharedString::from("Copying poster…"));
+        let c = ctrl.borrow();
+        let _ = c.worker.tx.send(Request::CopyPosterToClipboard { url });
+    }
+}
 
 fn copy_poster(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let bytes = ctrl.borrow().cover_bytes.clone();

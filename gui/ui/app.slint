@@ -19,7 +19,6 @@ import {
     HorizontalBox,
     GroupBox,
     StandardButton,
-    ProgressIndicator,
     Palette,
 } from "std-widgets.slint";
 
@@ -44,10 +43,48 @@ export global Theme {
     out property <brush> hover-row: dark ? #ffffff14 : #00000010;
     out property <brush> error-text: dark ? #e0a0a0 : #b00020;
     out property <brush> placeholder-text: dark ? #999999 : #888888;
-    // System selection/highlight colors (used for the selected poster tile,
-    // current-cover selection, and the selected match row).
-    out property <brush> highlight: Palette.selection-background;
-    out property <brush> highlight-text: Palette.selection-foreground;
+    // System selection/highlight colors. The controller reads the real OS
+    // colors (macOS: NSColor.controlAccentColor / selectedContentBackgroundColor;
+    // other platforms via Slint's Palette) and pushes them in here so the whole
+    // UI matches the user's chosen accent/highlight color. When `has-sys-colors`
+    // is false we fall back to Slint's Palette defaults.
+    in property <bool> has-sys-colors: false;
+    in property <brush> sys-highlight: #808080;
+    in property <brush> sys-highlight-text: #ffffff;
+    in property <brush> sys-accent: #808080;
+
+    out property <brush> highlight: has-sys-colors ? sys-highlight : Palette.selection-background;
+    out property <brush> highlight-text: has-sys-colors ? sys-highlight-text : Palette.selection-foreground;
+    // Accent used for the progress bar fill and other filled indicators.
+    out property <brush> accent: has-sys-colors ? sys-accent : Palette.selection-background;
+}
+
+// Clipboard focus context: which target Cut/Copy/Paste act on, so the Edit menu
+// items enable/route correctly.
+//   - `text-focused`  — a metadata text field has keyboard focus; text ops go to
+//                       the field (native selection). Bound from the built-in
+//                       TextInputInterface.text-input-focused.
+//   - `current-poster`— the current-cover poster is selected (Cut/Copy/Paste all
+//                       apply, respecting the poster lock).
+//   - `grid-poster`   — a TMDB grid poster is selected (Copy only).
+// When nothing is focused/selected, all three are disabled.
+export global ClipCtx {
+    in property <bool> text-focused: false;
+    in property <bool> current-poster: false;
+    in property <bool> grid-poster: false;
+    in property <bool> poster-locked: false;
+    in property <bool> current-poster-has-image: false;
+
+    out property <bool> can-cut:
+        root.text-focused
+        || (root.current-poster && root.current-poster-has-image && !root.poster-locked);
+    out property <bool> can-copy:
+        root.text-focused
+        || (root.current-poster && root.current-poster-has-image)
+        || root.grid-poster;
+    out property <bool> can-paste:
+        root.text-focused
+        || (root.current-poster && !root.poster-locked);
 }
 
 // One TMDB search result shown in the Matches list.
@@ -75,11 +112,14 @@ component TigerLineEdit inherits Rectangle {
     callback edited();
     callback accepted();
 
-    // Internal padding: half the std LineEdit's ~8px vertical padding.
+    // Internal padding: half the std LineEdit's ~8px vertical padding, with a
+    // couple extra px on top so the (centered) text isn't cramped against the
+    // border.
     property <length> pad-v: 4px;
+    property <length> pad-top: 6px;
     property <length> pad-h: 8px;
 
-    height: input.preferred-height + root.pad-v * 2;
+    height: input.preferred-height + root.pad-top + root.pad-v;
     border-width: 1px;
     border-radius: 4px;
     border-color: input.has-focus ? Theme.highlight : Theme.border;
@@ -90,9 +130,9 @@ component TigerLineEdit inherits Rectangle {
     // Placeholder shown when empty and unfocused.
     if input.text == "" && !input.has-focus: Text {
         x: root.pad-h;
-        y: root.pad-v;
+        y: root.pad-top;
         width: parent.width - root.pad-h * 2;
-        height: parent.height - root.pad-v * 2;
+        height: parent.height - root.pad-top - root.pad-v;
         text: root.placeholder-text;
         color: Theme.placeholder-text;
         vertical-alignment: center;
@@ -105,9 +145,9 @@ component TigerLineEdit inherits Rectangle {
         // and shift computed-x so the cursor stays visible (the primitive
         // TextInput doesn't auto-scroll). Mirrors the std LineEdit base.
         x: min(root.pad-h, max(parent.width - root.pad-h - self.width - self.text-cursor-width, self.computed-x));
-        y: root.pad-v;
+        y: root.pad-top;
         width: max(parent.width - root.pad-h * 2 - self.text-cursor-width, self.preferred-width);
-        height: parent.height - root.pad-v * 2;
+        height: parent.height - root.pad-top - root.pad-v;
         color: root.enabled ? Theme.text : Theme.muted-text;
         selection-background-color: Theme.highlight;
         selection-foreground-color: Theme.highlight-text;
@@ -137,6 +177,7 @@ component TigerTextEdit inherits Rectangle {
     callback edited();
 
     property <length> pad-v: 4px;
+    property <length> pad-top: 7px;   // a few px more at the top so text isn't cramped
     property <length> pad-h: 8px;
 
     border-width: 1px;
@@ -148,9 +189,9 @@ component TigerTextEdit inherits Rectangle {
 
     scroll := ScrollView {
         x: root.pad-h;
-        y: root.pad-v;
+        y: root.pad-top;
         width: parent.width - root.pad-h * 2;
-        height: parent.height - root.pad-v * 2;
+        height: parent.height - root.pad-top - root.pad-v;
         content-width: root.word-wrap ? self.visible-width : max(self.visible-width, input.preferred-width);
         content-height: max(self.visible-height, input.preferred-height);
 
@@ -334,6 +375,51 @@ export component MainWindow inherits Window {
         Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
     }
 
+    // Keep the ClipCtx global (drives the Edit menu's Cut/Copy/Paste enable +
+    // routing) in sync with the live focus/selection state. A hidden binder
+    // element mirrors the sources into the global reactively.
+    Rectangle {
+        width: 0px;
+        height: 0px;
+        property <bool> tf: TextInputInterface.text-input-focused;
+        property <bool> cp: root.poster-selected;
+        property <bool> gp: root.selected-poster-index >= 0;
+        property <bool> pl: root.lock-poster;
+        property <bool> ci: root.has-cover;
+        init => {
+            ClipCtx.text-focused = self.tf;
+            ClipCtx.current-poster = self.cp;
+            ClipCtx.grid-poster = self.gp;
+            ClipCtx.poster-locked = self.pl;
+            ClipCtx.current-poster-has-image = self.ci;
+        }
+        changed tf => {
+            ClipCtx.text-focused = self.tf;
+            // Focusing a text field takes clipboard focus: clear any poster
+            // selection so Cut/Copy/Paste target the field (and the poster
+            // highlight goes away).
+            if self.tf {
+                root.clear-poster-selection();
+            }
+        }
+        changed cp => { ClipCtx.current-poster = self.cp; }
+        changed gp => { ClipCtx.grid-poster = self.gp; }
+        changed pl => { ClipCtx.poster-locked = self.pl; }
+        changed ci => { ClipCtx.current-poster-has-image = self.ci; }
+    }
+
+    // A focusable, zero-size sink used to move keyboard focus off any text field
+    // when a poster is selected (so Cut/Copy/Paste target the poster, and the
+    // text-field selection highlight clears). `defocus-text()` is invoked from
+    // the poster click handlers.
+    defocus-sink := FocusScope {
+        width: 0px;
+        height: 0px;
+    }
+    public function defocus-text() {
+        defocus-sink.focus();
+    }
+
     // ---- Window / app state (set by the controller) --------------------
     in property <image> window-icon;
     in property <string> status: "Open an MP4/M4V file to begin.";
@@ -451,6 +537,7 @@ export component MainWindow inherits Window {
     callback rating-changed(int);
     callback fast-start-changed(bool);
     callback poster-clicked();           // toggle current-cover selection
+    callback clear-poster-selection();   // drop poster selection (text focused)
     callback poster-double-clicked();    // open lightbox on current cover
     callback poster-choice-clicked(int); // set TMDB poster #index as cover
     callback poster-choice-double-clicked(int);
@@ -494,7 +581,9 @@ export component MainWindow inherits Window {
                 activated => { root.write-tags(); }
             }
             MenuSeparator {}
-            MenuItem { title: "Settings…"; activated => { root.open-settings(); } }
+            // On macOS, Settings lives in the application menu (under About);
+            // on Windows/Linux it stays here in File.
+            if !root.is-macos: MenuItem { title: "Settings…"; activated => { root.open-settings(); } }
             // On macOS, Quit lives in the application menu, not File.
             if !root.is-macos: MenuSeparator {}
             if !root.is-macos: MenuItem {
@@ -518,19 +607,31 @@ export component MainWindow inherits Window {
                 activated => { root.do-redo(); }
             }
             MenuSeparator {}
+            // Cut/Copy/Paste are context-sensitive (see ClipCtx + the do-cut/
+            // do-copy/do-paste routers): they act on the focused text field's
+            // selection, the selected current poster, or (Copy only) a selected
+            // TMDB grid poster.
+            //
+            // NOTE: no `shortcut:` here on purpose. A menubar shortcut is matched
+            // by Slint *before* the key event reaches the focused item, so
+            // declaring Ctrl/Cmd+X/C/V would intercept the keystroke and prevent
+            // the focused TextInput from performing its own native cut/copy/paste
+            // (the field would never receive the key). Native text shortcuts work
+            // out of the box; the menu items (via click) still route correctly to
+            // the field or the selected poster.
             MenuItem {
                 title: "Cut";
-                shortcut: @keys(Control + X);
+                enabled: ClipCtx.can-cut;
                 activated => { root.do-cut(); }
             }
             MenuItem {
                 title: "Copy";
-                shortcut: @keys(Control + C);
+                enabled: ClipCtx.can-copy;
                 activated => { root.do-copy(); }
             }
             MenuItem {
                 title: "Paste";
-                shortcut: @keys(Control + V);
+                enabled: ClipCtx.can-paste;
                 activated => { root.do-paste(); }
             }
         }
@@ -589,14 +690,33 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
                 // Wrap the fixed-height bar so it centers vertically in the row
-                // (a bare fixed-height child would pin to the top).
+                // (a bare fixed-height child would pin to the top). Custom bar so
+                // the fill uses our accent color (which follows the OS accent),
+                // not Slint's hardcoded Fluent blue.
+                // A full-height container (stretched by the HorizontalBox) holds
+                // the fixed-height bar centered vertically. Centering via `y`
+                // only works inside a non-layout parent, hence this wrapper.
                 if root.show-progress: Rectangle {
                     horizontal-stretch: 1;
-                    ProgressIndicator {
+                    bar := Rectangle {
                         width: 100%;
                         height: 6px;
                         y: (parent.height - self.height) / 2;
-                        progress: root.progress-fraction;
+                        // Track.
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: self.height / 2;
+                            background: Theme.hairline;
+                        }
+                        // Fill.
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * min(1.0, max(0.0, root.progress-fraction));
+                            height: 100%;
+                            border-radius: self.height / 2;
+                            background: Theme.accent;
+                        }
                     }
                 }
                 if root.show-progress: Text {
@@ -655,16 +775,19 @@ export component MainWindow inherits Window {
                                 background: search-touch.pressed
                                     ? Theme.highlight.darker(0.2)
                                     : (search-touch.has-hover ? Theme.highlight : transparent);
-                                Text {
-                                    text: "🔍";
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    color: search-touch.has-hover ? Theme.highlight-text : Theme.text;
+                                Image {
+                                    source: @image-url("icons/magnifying-glass.svg");
+                                    colorize: search-touch.has-hover ? Theme.highlight-text : Theme.text;
+                                    width: 20px;
+                                    height: 20px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
                                 }
                                 search-touch := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.do-search(); }
                                 }
+                                Tooltip { text: @markdown("Search TMDB"); }
                             }
                         }
 
@@ -850,7 +973,7 @@ export component MainWindow inherits Window {
                                     }
 
                                     TouchArea {
-                                        clicked => { root.poster-clicked(); }
+                                        clicked => { root.defocus-text(); root.poster-clicked(); }
                                         double-clicked => { root.poster-double-clicked(); }
                                     }
                                 }
@@ -960,7 +1083,7 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 TouchArea {
-                                    clicked => { root.poster-choice-clicked(i); }
+                                    clicked => { root.defocus-text(); root.poster-choice-clicked(i); }
                                     double-clicked => { root.poster-choice-double-clicked(i); }
                                 }
                             }
@@ -1094,7 +1217,7 @@ export component MainWindow inherits Window {
                 HorizontalBox {
                     padding: 0px;
                     alignment: center;
-                    Button { text: "Close"; min-width: 90px; clicked => { root.splash-dismiss(); } }
+                    Button { text: "OK"; min-width: 90px; clicked => { root.splash-dismiss(); } }
                 }
             }
         }
@@ -1157,18 +1280,6 @@ export component MainWindow inherits Window {
                 spacing: 8px;
                 padding: 16px;
                 Text { text: "Settings"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
-                Text { text: "TMDB Bearer Token"; color: Theme.text; }
-                LineEdit {
-                    placeholder-text: "Paste your v4 read access token";
-                    input-type: password;
-                    text <=> root.settings-token;
-                    accepted => { root.settings-save(); }
-                }
-                Hyperlink {
-                    text: "To get a TMDB API Read Access Token…";
-                    url: "https://www.themoviedb.org/settings/api";
-                    open-url(u) => { root.open-url(u); }
-                }
                 HorizontalBox {
                     padding: 0px;
                     spacing: 8px;
@@ -1180,6 +1291,18 @@ export component MainWindow inherits Window {
                         // Apply live so the user sees the change immediately.
                         selected(v) => { root.theme-changed(self.current-index); }
                     }
+                }
+                Text { text: "TMDB Bearer Token"; color: Theme.text; }
+                LineEdit {
+                    placeholder-text: "Paste your v4 read access token";
+                    input-type: password;
+                    text <=> root.settings-token;
+                    accepted => { root.settings-save(); }
+                }
+                Hyperlink {
+                    text: "To get a TMDB API Read Access Token…";
+                    url: "https://www.themoviedb.org/settings/api";
+                    open-url(u) => { root.open-url(u); }
                 }
                 HorizontalBox {
                     alignment: end;

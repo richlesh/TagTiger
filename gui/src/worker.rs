@@ -41,6 +41,11 @@ pub enum Request {
     SetCoverFromUrl {
         url: String,
     },
+    /// Download a poster (e.g. a selected TMDB grid poster) and hand its bytes
+    /// back so the UI thread can place it on the system clipboard.
+    CopyPosterToClipboard {
+        url: String,
+    },
     WriteTags {
         file: PathBuf,
         meta: Box<MediaMetadata>,
@@ -102,6 +107,11 @@ pub enum Event {
         height: u32,
         rgba: Vec<u8>,
         orig_size: (u32, u32),
+        bytes: Vec<u8>,
+    },
+    /// Raw poster bytes to place on the system clipboard (UI thread does the
+    /// actual clipboard write). Used by the grid-poster Copy action.
+    CopyToClipboard {
         bytes: Vec<u8>,
     },
     WriteDone {
@@ -265,6 +275,10 @@ async fn handle(
                 orig_size,
                 bytes,
             }))
+        }
+        Request::CopyPosterToClipboard { url } => {
+            let bytes = artwork::download(&client, &url).await?;
+            Ok(Some(Event::CopyToClipboard { bytes }))
         }
         Request::WriteTags {
             file,

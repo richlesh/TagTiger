@@ -32,12 +32,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_app_kit::{NSApplication, NSMenu};
-use objc2_foundation::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+use objc2_foundation::{MainThreadMarker, NSString};
 
 /// Set by our "About" action; polled/cleared by the controller which then shows
 /// the About dialog.
 static ABOUT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set by our "Settings…" app-menu item (macOS puts Settings in the app menu).
+static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// True if the native About item has been chosen since the last check (clears
 /// the flag). Called from the UI event loop (see app.rs `drain_events`).
@@ -45,7 +47,12 @@ pub fn take_about_requested() -> bool {
     ABOUT_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
-// A process-lifetime Objective-C object that receives the About action.
+/// True if the app-menu Settings item has been chosen since the last check.
+pub fn take_settings_requested() -> bool {
+    SETTINGS_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+// A process-lifetime Objective-C object that receives the About/Settings actions.
 objc2::declare_class!(
     struct MenuTarget;
 
@@ -62,6 +69,11 @@ objc2::declare_class!(
         unsafe fn tiger_about(&self, _sender: *mut AnyObject) {
             ABOUT_REQUESTED.store(true, Ordering::Relaxed);
         }
+
+        #[method(tigerSettings:)]
+        unsafe fn tiger_settings(&self, _sender: *mut AnyObject) {
+            SETTINGS_REQUESTED.store(true, Ordering::Relaxed);
+        }
     }
 );
 
@@ -71,10 +83,12 @@ thread_local! {
         unsafe { msg_send_id![MenuTarget::alloc(), init] };
 }
 
-/// Re-point the app-menu "About" item at our dialog, if muda has (re)built the
-/// menu with its own About action. Idempotent and safe to call every UI tick;
-/// a no-op once our override is in place, until muda rebuilds the menu again.
-pub fn enforce_about_override() {
+/// Keep the app-menu customizations in place (idempotent, safe every UI tick):
+///   1. Re-point the "About" item at our dialog.
+///   2. Insert a "Settings…" item (Cmd+,) right after About, per macOS
+///      convention. muda rebuilds the menu on property changes, so we re-apply
+///      whenever our items are missing.
+pub fn enforce_app_menu() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -83,7 +97,6 @@ pub fn enforce_about_override() {
         let Some(main_menu): Option<Retained<NSMenu>> = app.mainMenu() else {
             return;
         };
-        // The application menu is the first submenu of the main menu.
         if main_menu.numberOfItems() == 0 {
             return;
         }
@@ -96,23 +109,60 @@ pub fn enforce_about_override() {
         if app_menu.numberOfItems() == 0 {
             return;
         }
-        // muda lays the app menu out as [About, sep, Services, …]; the About
-        // item is index 0.
+        // muda lays the app menu out as [About, sep, Services, …].
         let Some(about_item) = app_menu.itemAtIndex(0) else {
             return;
         };
 
-        let our_sel: Sel = sel!(tigerAbout:);
-        let current: Sel = msg_send![&about_item, action];
-        // Already ours? Nothing to do (muda hasn't rebuilt since we patched).
-        if current == our_sel {
-            return;
+        let about_sel: Sel = sel!(tigerAbout:);
+        let settings_sel: Sel = sel!(tigerSettings:);
+
+        let about_action: Sel = msg_send![&about_item, action];
+        let about_ok = about_action == about_sel;
+
+        // Is our Settings item already present at index 1?
+        let settings_present = if app_menu.numberOfItems() > 1 {
+            if let Some(it) = app_menu.itemAtIndex(1) {
+                let a: Sel = msg_send![&it, action];
+                a == settings_sel
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if about_ok && settings_present {
+            return; // Nothing to do since muda's last rebuild.
         }
 
         TARGET.with(|target| {
             let target_obj: &AnyObject = target;
-            let _: () = msg_send![&about_item, setTarget: target_obj];
-            let _: () = msg_send![&about_item, setAction: our_sel];
+
+            if !about_ok {
+                let _: () = msg_send![&about_item, setTarget: target_obj];
+                let _: () = msg_send![&about_item, setAction: about_sel];
+            }
+
+            if !settings_present {
+                // Build "Settings…" (Cmd+,) and insert it right after About,
+                // followed by a separator, matching macOS conventions.
+                let title = NSString::from_str("Settings…");
+                let key = NSString::from_str(",");
+                let item: Retained<NSMenuItem> = {
+                    let alloc = mtm.alloc::<NSMenuItem>();
+                    msg_send_id![
+                        alloc,
+                        initWithTitle: &*title,
+                        action: settings_sel,
+                        keyEquivalent: &*key,
+                    ]
+                };
+                let _: () = msg_send![&item, setTarget: target_obj];
+                app_menu.insertItem_atIndex(&item, 1);
+                let sep = NSMenuItem::separatorItem(mtm);
+                app_menu.insertItem_atIndex(&sep, 2);
+            }
         });
     }
 }
