@@ -12,6 +12,12 @@ use tagtiger_core::{
 };
 
 /// Requests the UI sends to the worker.
+//
+// The worker integration test includes this file standalone via `#[path]`, so
+// from that compilation unit's view the variants constructed only by the
+// controller (app.rs) look "never constructed". They're fully used in the
+// binary; allow dead_code so `-D warnings` doesn't trip on the test build.
+#[allow(dead_code)]
 pub enum Request {
     /// Open a native file picker (async, off the UI thread) and load the
     /// existing tags + cover art from the chosen file.
@@ -64,6 +70,9 @@ pub enum Request {
 }
 
 /// Events the worker sends back to the UI.
+// See the note on `Request`: the integration test includes this file
+// standalone, so variants/fields consumed only by the controller look unused.
+#[allow(dead_code)]
 pub enum Event {
     /// A file was opened: its existing metadata, an optional decoded cover
     /// thumbnail (rgba), and a suggested search string (existing title or the
