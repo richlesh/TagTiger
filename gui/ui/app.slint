@@ -149,7 +149,7 @@ component DialogScrim inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "TagTiger";
-    preferred-width: 980px;
+    preferred-width: 1030px;
     preferred-height: 720px;
     min-width: 760px;
     min-height: 560px;
@@ -284,6 +284,9 @@ export component MainWindow inherits Window {
     callback poster-double-clicked();    // open lightbox on current cover
     callback poster-choice-clicked(int); // set TMDB poster #index as cover
     callback poster-choice-double-clicked(int);
+    // Reports the visible poster-grid row range (first, last inclusive) and the
+    // column count, so the controller can lazily fetch only visible thumbnails.
+    callback poster-rows-visible(int, int, int);
     callback write-tags();
     // Dialog callbacks.
     callback open-url(string);           // open a hyperlink in the browser
@@ -338,14 +341,24 @@ export component MainWindow inherits Window {
         padding: 8px;
         spacing: 6px;
 
-        // Top action row: Open button + status text.
+        // Top action row (fixed): Open + Write icon buttons + status text.
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
             vertical-stretch: 0;
             Button {
-                text: "Open file…";
+                icon: @image-url("icons/folder-open.svg");
+                colorize-icon: true;
                 clicked => { root.open-file(); }
+                Tooltip { text: @markdown("Open File"); }
+            }
+            Button {
+                icon: @image-url("icons/floppy-disk.svg");
+                colorize-icon: true;
+                // Only meaningful once a file is open; also blocked mid-write.
+                enabled: root.file-loaded && !root.writing;
+                clicked => { root.write-tags(); }
+                Tooltip { text: @markdown("Write Tags"); }
             }
             Text {
                 text: root.status;
@@ -369,7 +382,7 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
-                if root.file-loaded: ScrollView {
+                if root.file-loaded: editor-scroll := ScrollView {
                     VerticalBox {
                         padding: 0px;
                         spacing: 6px;
@@ -597,38 +610,63 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: Theme.hairline; }
 
-                        Button {
-                            text: "Write tags";
-                            enabled: !root.writing;
-                            clicked => { root.write-tags(); }
-                        }
-
-                        Rectangle { height: 1px; background: Theme.hairline; }
-
                         Text { text: "Poster choices (TMDB)"; font-size: 16px; font-weight: 700; }
                         Text { text: "Click to set as current poster · double-click to enlarge"; color: Theme.muted-text; }
 
-                        // Poster grid: a wrapping grid of fixed-size tiles laid
-                        // out in a fixed number of columns. Tiles are absolutely
-                        // positioned from their index so the grid wraps, and the
-                        // enclosing Flickable scrolls vertically when it overflows.
-                        Flickable {
-                            property <int> columns: 4;
-                            property <length> tile-w: 120px;
+                        // Poster grid: a wrapping grid that fills the pane width
+                        // and lays out at its full height, so the outer editor
+                        // ScrollView scrolls it (a single scrollbar for the whole
+                        // editor). Thumbnails load lazily: we compute which rows
+                        // are inside the ScrollView's viewport by comparing the
+                        // grid's `absolute-position` (which moves as you scroll)
+                        // against the fixed viewport top/height, and report that
+                        // range to the controller.
+                        poster-grid := Rectangle {
+                            property <length> min-tile-w: 120px;
                             property <length> tile-h: 180px;
                             property <length> gap: 8px;
+                            property <int> columns: max(1, floor((self.width + self.gap) / (self.min-tile-w + self.gap)));
+                            property <length> cell-w: (self.width - (self.columns - 1) * self.gap) / self.columns;
+                            property <length> row-h: self.tile-h + self.gap;
                             property <int> row-count: root.posters.length > 0
                                 ? (root.posters.length + self.columns - 1) / self.columns
                                 : 0;
-                            height: 240px;
-                            content-width: self.width;
-                            content-height: self.row-count * (self.tile-h + self.gap);
+                            // Full content height so the outer ScrollView scrolls
+                            // the whole grid.
+                            height: self.row-count > 0 ? self.row-count * self.row-h - self.gap : 0px;
+
+                            // Grid top relative to the (fixed) viewport top. As
+                            // you scroll down, the grid moves up so this goes
+                            // negative; -offset-in-grid is how far the viewport
+                            // top has advanced into the grid.
+                            property <length> offset-into-grid: editor-scroll.absolute-position.y - self.absolute-position.y;
+                            property <length> viewport-h: editor-scroll.visible-height;
+                            // Inclusive visible row range, with one row of margin
+                            // each side to prefetch just off-screen.
+                            property <int> first-visible-row: max(0, floor((self.offset-into-grid - self.row-h) / self.row-h));
+                            property <int> last-visible-row: floor((self.offset-into-grid + self.viewport-h + self.row-h) / self.row-h);
+
+                            // Re-evaluate the visible range whenever the grid
+                            // scrolls (absolute-position changes), the viewport
+                            // resizes, or the layout (columns/rows) changes.
+                            changed first-visible-row => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed last-visible-row => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed columns => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
+                            changed row-count => {
+                                root.poster-rows-visible(self.first-visible-row, self.last-visible-row, self.columns);
+                            }
 
                             for poster[i] in root.posters: Rectangle {
-                                x: mod(i, parent.columns) * (parent.tile-w + parent.gap);
-                                y: floor(i / parent.columns) * (parent.tile-h + parent.gap);
-                                width: parent.tile-w;
-                                height: parent.tile-h;
+                                x: mod(i, poster-grid.columns) * (poster-grid.cell-w + poster-grid.gap);
+                                y: floor(i / poster-grid.columns) * poster-grid.row-h;
+                                width: poster-grid.cell-w;
+                                height: poster-grid.tile-h;
                                 border-width: 1px;
                                 border-color: Theme.border;
                                 border-radius: 4px;
@@ -665,7 +703,6 @@ export component MainWindow inherits Window {
                     color: Theme.muted-text;
                     wrap: word-wrap;
                 }
-                if root.loading-details: Text { text: "Loading details…"; color: Theme.muted-text; }
                 ListView {
                     vertical-stretch: 1;
                     for m[i] in root.matches: Rectangle {

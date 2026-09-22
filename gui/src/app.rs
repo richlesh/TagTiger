@@ -613,8 +613,12 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
             }
         }
     });
-
-    // --- Write ---
+    window.on_poster_rows_visible({
+        let ctrl = ctrl.clone();
+        move |first_row, last_row, columns| {
+            request_visible_thumbs(&ctrl, first_row, last_row, columns);
+        }
+    });
     {
         let ctrl = ctrl.clone();
         let handle = window.as_weak();
@@ -1231,22 +1235,74 @@ fn load_meta(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, meta: MediaMetadata
     }
     w.set_show_lightbox(false);
 
-    // Eagerly request thumbnails for every candidate (result sets are small).
-    {
-        let c = ctrl.borrow();
-        for (i, art) in meta.artwork.iter().enumerate() {
-            let thumb_url = art.thumb_url.clone().unwrap_or_else(|| art.url.clone());
-            let _ = c.worker.tx.send(Request::FetchThumb {
-                index: i,
-                url: thumb_url,
-            });
-        }
-    }
-    ctrl.borrow_mut().thumb_requested = vec![true; n];
-
+    // Thumbnails load lazily as their grid rows scroll into view — the
+    // poster-rows-visible callback drives fetching (see request_visible_thumbs).
+    // Request the initially-visible rows now (row 0 onward for the ~2 rows the
+    // 240px viewport shows). The grid also fires the callback once it lays out.
     ctrl.borrow_mut().meta = Some(meta);
+    request_visible_thumbs(ctrl, 0, 1, 4);
     refresh_committed(ctrl, w);
     update_undo_redo(ctrl, w);
+}
+
+/// Compute the inclusive artwork-index range `[first, last]` covered by grid
+/// rows `[first_row, last_row]` at `columns` per row, clamped to `count` items.
+/// Returns `None` when there's nothing to cover (no columns or no items).
+fn visible_index_range(
+    first_row: i32,
+    last_row: i32,
+    columns: i32,
+    count: usize,
+) -> Option<(usize, usize)> {
+    if columns < 1 || count == 0 {
+        return None;
+    }
+    let columns = columns as usize;
+    let first = (first_row.max(0) as usize) * columns;
+    if first >= count {
+        return None;
+    }
+    // last_row is inclusive, so include the whole last row.
+    let last = (((last_row.max(0) as usize) + 1) * columns - 1).min(count - 1);
+    Some((first, last))
+}
+
+/// Fetch thumbnails for the poster grid rows in the inclusive range
+/// `[first_row, last_row]` (with `columns` per row) that haven't been requested
+/// yet. Called from the `poster-rows-visible` callback as the user scrolls, and
+/// once when a match's posters first load.
+fn request_visible_thumbs(ctrl: &Rc<RefCell<Controller>>, first_row: i32, last_row: i32, columns: i32) {
+    let mut to_fetch: Vec<(usize, String)> = Vec::new();
+    {
+        let mut c = ctrl.borrow_mut();
+        let count = c.meta.as_ref().map(|m| m.artwork.len()).unwrap_or(0);
+        let Some((first, last)) = visible_index_range(first_row, last_row, columns, count) else {
+            return;
+        };
+        let meta = c.meta.clone();
+        let Some(meta) = meta else {
+            return;
+        };
+        // Collect (index, url) for visible, not-yet-requested tiles.
+        for i in first..=last {
+            if c.thumb_requested.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let art = &meta.artwork[i];
+            let url = art.thumb_url.clone().unwrap_or_else(|| art.url.clone());
+            to_fetch.push((i, url));
+        }
+        // Mark as requested before sending so a rapid re-scroll doesn't double-fetch.
+        for (i, _) in &to_fetch {
+            if let Some(flag) = c.thumb_requested.get_mut(*i) {
+                *flag = true;
+            }
+        }
+    }
+    let c = ctrl.borrow();
+    for (i, url) in to_fetch {
+        let _ = c.worker.tx.send(Request::FetchThumb { index: i, url });
+    }
 }
 
 /// Rebuild a MediaMetadata from the edited properties before writing.
@@ -1923,6 +1979,23 @@ mod map_tests {
     fn split_csv_trims_and_drops_empties() {
         assert_eq!(split_csv("a, b ,,c"), vec!["a", "b", "c"]);
         assert_eq!(split_csv("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn visible_index_range_maps_rows_to_indices() {
+        // 4 columns, 20 items. Rows 0..=1 -> indices 0..=7.
+        assert_eq!(visible_index_range(0, 1, 4, 20), Some((0, 7)));
+        // Rows 2..=3 -> indices 8..=15.
+        assert_eq!(visible_index_range(2, 3, 4, 20), Some((8, 15)));
+        // Last row clamps to the item count (20 items -> max index 19).
+        assert_eq!(visible_index_range(4, 6, 4, 20), Some((16, 19)));
+        // Negative rows clamp to 0.
+        assert_eq!(visible_index_range(-2, 0, 4, 20), Some((0, 3)));
+        // First row beyond the data -> nothing.
+        assert_eq!(visible_index_range(10, 12, 4, 20), None);
+        // No columns or no items -> nothing.
+        assert_eq!(visible_index_range(0, 1, 0, 20), None);
+        assert_eq!(visible_index_range(0, 1, 4, 0), None);
     }
 }
 
