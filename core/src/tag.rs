@@ -284,13 +284,34 @@ fn xml_unescape(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
+/// Which phase of a layout-changing save is currently streaming, so a UI can
+/// label its progress. An in-place edit (no layout change) reports no progress
+/// at all, so callers never see these for the cheap path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePhase {
+    /// Pass 1: copying the original to a working temp file.
+    Copying,
+    /// Pass 2: rewriting into the requested (fast-start / moov-last) layout.
+    Optimizing,
+}
+
+impl WritePhase {
+    /// A short human-readable label for status text.
+    pub fn label(self) -> &'static str {
+        match self {
+            WritePhase::Copying => "Copying",
+            WritePhase::Optimizing => "Optimizing layout",
+        }
+    }
+}
+
 pub fn write_to_file(
     path: impl AsRef<Path>,
     meta: &MediaMetadata,
     artwork: Option<&EncodedArtwork>,
     fast_start: bool,
 ) -> Result<()> {
-    write_to_file_with_progress(path, meta, artwork, fast_start, &mut |_, _| {})
+    write_to_file_with_progress(path, meta, artwork, fast_start, &mut |_, _, _| {})
 }
 
 /// Write metadata, producing the layout requested by `fast_start`:
@@ -314,7 +335,7 @@ pub fn write_to_file_with_progress(
     meta: &MediaMetadata,
     artwork: Option<&EncodedArtwork>,
     fast_start: bool,
-    progress: &mut dyn FnMut(u64, u64),
+    progress: &mut dyn FnMut(WritePhase, u64, u64),
 ) -> Result<()> {
     let path = path.as_ref();
 
@@ -347,15 +368,21 @@ pub fn write_to_file_with_progress(
 
     let result = (|| -> Result<()> {
         // 1) Copy original -> temp so mp4ameta never touches the original.
-        crate::mp4rewrite::copy_file_with_progress(path, &tmp, progress)?;
+        crate::mp4rewrite::copy_file_with_progress(path, &tmp, &mut |d, t| {
+            progress(WritePhase::Copying, d, t)
+        })?;
         // 2) Let mp4ameta perform the tag edit on the temp.
         apply_tag_in_place(&tmp, meta, artwork)?;
         // 3) Normalize the temp into the requested layout (tmp -> tmp2), then
         //    swap tmp2 in as the finished temp.
         let normalized = if fast_start {
-            crate::mp4rewrite::normalize_moov_first(&tmp, &tmp2, progress)?
+            crate::mp4rewrite::normalize_moov_first(&tmp, &tmp2, &mut |d, t| {
+                progress(WritePhase::Optimizing, d, t)
+            })?
         } else {
-            crate::mp4rewrite::normalize_moov_last(&tmp, &tmp2, progress)?
+            crate::mp4rewrite::normalize_moov_last(&tmp, &tmp2, &mut |d, t| {
+                progress(WritePhase::Optimizing, d, t)
+            })?
         };
         if normalized {
             std::fs::rename(&tmp2, &tmp)?;

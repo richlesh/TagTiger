@@ -11,6 +11,8 @@ mod app;
 mod license;
 mod license_mgr;
 #[cfg(target_os = "macos")]
+mod macos_menu;
+#[cfg(target_os = "macos")]
 mod macos_open;
 mod worker;
 

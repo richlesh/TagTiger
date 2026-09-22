@@ -37,7 +37,7 @@ serde_json.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5.2"
 objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSArray", "NSURL", "NSData", "NSGeometry"] }
-objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSResponder", "NSDragging"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSResponder", "NSDragging", "NSMenu", "NSMenuItem", "NSApplication"] }
 # Obtain the NSView from the Slint window for native file drag-and-drop.
 raw-window-handle = "0.6"
 

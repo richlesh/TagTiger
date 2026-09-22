@@ -44,6 +44,10 @@ export global Theme {
     out property <brush> hover-row: dark ? #ffffff14 : #00000010;
     out property <brush> error-text: dark ? #e0a0a0 : #b00020;
     out property <brush> placeholder-text: dark ? #999999 : #888888;
+    // System selection/highlight colors (used for the selected poster tile,
+    // current-cover selection, and the selected match row).
+    out property <brush> highlight: Palette.selection-background;
+    out property <brush> highlight-text: Palette.selection-foreground;
 }
 
 // One TMDB search result shown in the Matches list.
@@ -56,6 +60,132 @@ export struct MatchItem {
 export struct PosterItem {
     image: image,
     loaded: bool,
+    size: string,   // e.g. "500 x 750", shown under the thumbnail
+}
+
+// Custom single-line input. Built on the primitive `TextInput` (rather than the
+// std-widget `LineEdit`) so we control the internal vertical padding directly —
+// the built-in widget bakes in ~8px top/bottom, which visually clips the text
+// in our tight rows. Here we use half that (4px) while keeping the themed
+// border, placeholder, selection colors, and enabled state.
+component TigerLineEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder-text;
+    in property <bool> enabled: true;
+    callback edited();
+    callback accepted();
+
+    // Internal padding: half the std LineEdit's ~8px vertical padding.
+    property <length> pad-v: 4px;
+    property <length> pad-h: 8px;
+
+    height: input.preferred-height + root.pad-v * 2;
+    border-width: 1px;
+    border-radius: 4px;
+    border-color: input.has-focus ? Theme.highlight : Theme.border;
+    background: root.enabled ? Theme.window-bg : Theme.card-bg;
+    clip: true;
+    forward-focus: input;
+
+    // Placeholder shown when empty and unfocused.
+    if input.text == "" && !input.has-focus: Text {
+        x: root.pad-h;
+        y: root.pad-v;
+        width: parent.width - root.pad-h * 2;
+        height: parent.height - root.pad-v * 2;
+        text: root.placeholder-text;
+        color: Theme.placeholder-text;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    input := TextInput {
+        property <length> computed-x;
+        // Padding-aware horizontal scroll: keep the text within [pad-h .. width-pad-h]
+        // and shift computed-x so the cursor stays visible (the primitive
+        // TextInput doesn't auto-scroll). Mirrors the std LineEdit base.
+        x: min(root.pad-h, max(parent.width - root.pad-h - self.width - self.text-cursor-width, self.computed-x));
+        y: root.pad-v;
+        width: max(parent.width - root.pad-h * 2 - self.text-cursor-width, self.preferred-width);
+        height: parent.height - root.pad-v * 2;
+        color: root.enabled ? Theme.text : Theme.muted-text;
+        selection-background-color: Theme.highlight;
+        selection-foreground-color: Theme.highlight-text;
+        enabled: root.enabled;
+        single-line: true;
+        vertical-alignment: center;
+        edited => { root.edited(); }
+        accepted => { root.accepted(); }
+
+        cursor-position-changed(cpos) => {
+            if cpos.x + self.computed-x < root.pad-h {
+                self.computed-x = -cpos.x + root.pad-h;
+            } else if cpos.x + self.computed-x > parent.width - root.pad-h - self.text-cursor-width {
+                self.computed-x = parent.width - cpos.x - root.pad-h - self.text-cursor-width;
+            }
+        }
+    }
+}
+
+// Custom multi-line input, same rationale as TigerLineEdit: control the
+// vertical padding (half the std TextEdit's) so text isn't clipped, with a
+// scrollable text area for long content.
+component TigerTextEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    in property <bool> word-wrap: true;
+    callback edited();
+
+    property <length> pad-v: 4px;
+    property <length> pad-h: 8px;
+
+    border-width: 1px;
+    border-radius: 4px;
+    border-color: input.has-focus ? Theme.highlight : Theme.border;
+    background: root.enabled ? Theme.window-bg : Theme.card-bg;
+    clip: true;
+    forward-focus: input;
+
+    scroll := ScrollView {
+        x: root.pad-h;
+        y: root.pad-v;
+        width: parent.width - root.pad-h * 2;
+        height: parent.height - root.pad-v * 2;
+        content-width: root.word-wrap ? self.visible-width : max(self.visible-width, input.preferred-width);
+        content-height: max(self.visible-height, input.preferred-height);
+
+        input := TextInput {
+            width: parent.width;
+            color: root.enabled ? Theme.text : Theme.muted-text;
+            selection-background-color: Theme.highlight;
+            selection-foreground-color: Theme.highlight-text;
+            enabled: root.enabled;
+            single-line: false;
+            wrap: root.word-wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
+            page-height: scroll.visible-height;
+            edited => { root.edited(); }
+
+            // The primitive TextInput does not auto-scroll to the cursor; the
+            // enclosing widget must, using cursor-position-changed. Mirrors the
+            // std TextEdit's logic (20px ~ one line height).
+            cursor-position-changed(cpos) => {
+                if (cpos.x + scroll.content-x < 0px) {
+                    scroll.content-x = min(0px, max(scroll.visible-width - self.width, -cpos.x));
+                } else if (cpos.x + scroll.content-x > scroll.visible-width) {
+                    scroll.content-x = min(0px, max(scroll.visible-width - self.width, scroll.visible-width - cpos.x));
+                }
+                if (cpos.y + scroll.content-y < 0px) {
+                    scroll.content-y = min(
+                        0px,
+                        scroll.visible-height - cpos.y - 20px,
+                        max(scroll.visible-height - self.height, -cpos.y),
+                    );
+                } else if (cpos.y + scroll.content-y > scroll.visible-height - 20px) {
+                    scroll.content-y = min(0px, max(scroll.visible-height - self.height, scroll.visible-height - cpos.y - 20px));
+                }
+            }
+        }
+    }
 }
 
 // A labelled single-line field with a per-field Lock checkbox. The label is
@@ -76,7 +206,7 @@ component FieldRow inherits HorizontalBox {
         horizontal-alignment: right;
         vertical-alignment: center;
     }
-    LineEdit {
+    TigerLineEdit {
         horizontal-stretch: 1;
         text <=> root.value;
         enabled: !root.locked;
@@ -106,12 +236,12 @@ component PeopleRow inherits HorizontalBox {
         horizontal-alignment: right;
         vertical-alignment: center;
     }
-    TextEdit {
+    TigerTextEdit {
         horizontal-stretch: 1;
         height: root.input-height;
         text <=> root.value;
         enabled: !root.locked;
-        wrap: word-wrap;
+        word-wrap: true;
         edited => { root.edited(); }
     }
     CheckBox {
@@ -145,6 +275,41 @@ component DialogScrim inherits Rectangle {
         clicked => { root.dismiss(); }
     }
     @children
+}
+
+// A square icon button that highlights in the system highlight color on hover.
+// The icon is colorized to the theme text color (or the highlight-contrast
+// color while hovered), and a tooltip is shown on hover.
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    // Square: match width to height.
+    property <length> side: 30px;
+    width: root.side;
+    height: root.side;
+    border-radius: 5px;
+    background: !root.enabled
+        ? transparent
+        : (touch.pressed ? Theme.highlight.darker(0.2)
+            : (touch.has-hover ? Theme.highlight : transparent));
+
+    Image {
+        source: root.icon;
+        colorize: root.enabled
+            ? (touch.has-hover ? Theme.highlight-text : Theme.text)
+            : Theme.muted-text;
+        width: 20px;
+        height: 20px;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Tooltip { text: @markdown("\{root.tooltip}"); }
 }
 
 export component MainWindow inherits Window {
@@ -227,9 +392,13 @@ export component MainWindow inherits Window {
 
     // ---- Matches (TMDB search results) --------------------------------
     in property <[MatchItem]> matches;
+    // Index of the selected match row (-1 = none), highlighted in the list.
+    in property <int> selected-match-index: -1;
 
     // ---- TMDB poster choices ------------------------------------------
     in property <[PosterItem]> posters;
+    // Index of the selected poster tile (-1 = none), highlighted in the grid.
+    in property <int> selected-poster-index: -1;
 
     // ---- Undo/redo availability (drives Edit menu enabled state) ------
     in property <bool> can-undo: false;
@@ -257,6 +426,7 @@ export component MainWindow inherits Window {
     in property <bool> show-progress: false;
     in property <float> progress-fraction: 0.0;
     in property <string> progress-caption;
+    in property <string> progress-phase;
     in property <bool> show-complete: false;
     in property <string> complete-msg;
 
@@ -305,24 +475,64 @@ export component MainWindow inherits Window {
 
     // Whether this platform shows the "Install Command-Line Tool" item.
     in property <bool> show-install-cli: false;
+    // True on macOS, where About/Quit live in the application menu rather than
+    // the File/Help menus.
+    in property <bool> is-macos: false;
 
     MenuBar {
         Menu {
             title: "File";
-            MenuItem { title: "Open…"; activated => { root.open-file(); } }
+            MenuItem {
+                title: "Open…";
+                shortcut: @keys(Control + O);
+                activated => { root.open-file(); }
+            }
+            MenuItem {
+                title: "Write Tags";
+                enabled: root.file-loaded && !root.writing;
+                shortcut: @keys(Control + S);
+                activated => { root.write-tags(); }
+            }
             MenuSeparator {}
             MenuItem { title: "Settings…"; activated => { root.open-settings(); } }
-            MenuSeparator {}
-            MenuItem { title: "Quit"; activated => { root.quit(); } }
+            // On macOS, Quit lives in the application menu, not File.
+            if !root.is-macos: MenuSeparator {}
+            if !root.is-macos: MenuItem {
+                title: "Quit";
+                shortcut: @keys(Control + Q);
+                activated => { root.quit(); }
+            }
         }
         Menu {
             title: "Edit";
-            MenuItem { title: "Undo"; enabled: root.can-undo; activated => { root.do-undo(); } }
-            MenuItem { title: "Redo"; enabled: root.can-redo; activated => { root.do-redo(); } }
+            MenuItem {
+                title: "Undo";
+                enabled: root.can-undo;
+                shortcut: @keys(Control + Z);
+                activated => { root.do-undo(); }
+            }
+            MenuItem {
+                title: "Redo";
+                enabled: root.can-redo;
+                shortcut: @keys(Control + Shift + Z);
+                activated => { root.do-redo(); }
+            }
             MenuSeparator {}
-            MenuItem { title: "Cut"; activated => { root.do-cut(); } }
-            MenuItem { title: "Copy"; activated => { root.do-copy(); } }
-            MenuItem { title: "Paste"; activated => { root.do-paste(); } }
+            MenuItem {
+                title: "Cut";
+                shortcut: @keys(Control + X);
+                activated => { root.do-cut(); }
+            }
+            MenuItem {
+                title: "Copy";
+                shortcut: @keys(Control + C);
+                activated => { root.do-copy(); }
+            }
+            MenuItem {
+                title: "Paste";
+                shortcut: @keys(Control + V);
+                activated => { root.do-paste(); }
+            }
         }
         Menu {
             title: "Help";
@@ -332,8 +542,9 @@ export component MainWindow inherits Window {
                 enabled: root.show-install-cli;
                 activated => { root.install-cli(); }
             }
-            MenuSeparator {}
-            MenuItem { title: "About TagTiger"; activated => { root.open-about(); } }
+            // On macOS, About lives in the application menu, not Help.
+            if !root.is-macos: MenuSeparator {}
+            if !root.is-macos: MenuItem { title: "About TagTiger"; activated => { root.open-about(); } }
         }
     }
 
@@ -346,25 +557,53 @@ export component MainWindow inherits Window {
             padding: 0px;
             spacing: 8px;
             vertical-stretch: 0;
-            Button {
+            IconButton {
                 icon: @image-url("icons/folder-open.svg");
-                colorize-icon: true;
+                tooltip: "Open File";
                 clicked => { root.open-file(); }
-                Tooltip { text: @markdown("Open File"); }
             }
-            Button {
+            IconButton {
                 icon: @image-url("icons/floppy-disk.svg");
-                colorize-icon: true;
+                tooltip: "Write Tags";
                 // Only meaningful once a file is open; also blocked mid-write.
                 enabled: root.file-loaded && !root.writing;
                 clicked => { root.write-tags(); }
-                Tooltip { text: @markdown("Write Tags"); }
             }
-            Text {
-                text: root.status;
-                vertical-alignment: center;
+            // Status area: shows the status text, or — while saving — an inline
+            // progress bar with a MiB caption (no separate dialog).
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
                 horizontal-stretch: 1;
-                overflow: elide;
+                if !root.show-progress: Text {
+                    text: root.status;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                if root.show-progress: Text {
+                    text: root.progress-phase == ""
+                        ? "Saving…"
+                        : "Saving — " + root.progress-phase + "…";
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                }
+                // Wrap the fixed-height bar so it centers vertically in the row
+                // (a bare fixed-height child would pin to the top).
+                if root.show-progress: Rectangle {
+                    horizontal-stretch: 1;
+                    ProgressIndicator {
+                        width: 100%;
+                        height: 6px;
+                        y: (parent.height - self.height) / 2;
+                        progress: root.progress-fraction;
+                    }
+                }
+                if root.show-progress: Text {
+                    text: root.progress-caption;
+                    color: Theme.muted-text;
+                    vertical-alignment: center;
+                }
             }
         }
 
@@ -404,9 +643,28 @@ export component MainWindow inherits Window {
                                 text <=> root.search-query;
                                 accepted => { root.do-search(); }
                             }
-                            Button {
-                                text: "🔍";
-                                clicked => { root.do-search(); }
+                            // Search button: highlights in the system highlight
+                            // color on hover (the std Button shows no hover state
+                            // in the native macOS style), mirroring IconButton.
+                            Rectangle {
+                                width: 34px;
+                                height: 30px;
+                                border-radius: 5px;
+                                border-width: 1px;
+                                border-color: search-touch.has-hover ? Theme.highlight : Theme.border;
+                                background: search-touch.pressed
+                                    ? Theme.highlight.darker(0.2)
+                                    : (search-touch.has-hover ? Theme.highlight : transparent);
+                                Text {
+                                    text: "🔍";
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    color: search-touch.has-hover ? Theme.highlight-text : Theme.text;
+                                }
+                                search-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.do-search(); }
+                                }
                             }
                         }
 
@@ -574,7 +832,7 @@ export component MainWindow inherits Window {
                                     width: 150px;
                                     height: 210px;
                                     border-width: root.poster-selected ? 3px : 1px;
-                                    border-color: root.poster-selected ? Palette.accent-background : Theme.border;
+                                    border-color: root.poster-selected ? Theme.highlight : Theme.border;
                                     border-radius: 4px;
                                     clip: true;
 
@@ -624,10 +882,12 @@ export component MainWindow inherits Window {
                         poster-grid := Rectangle {
                             property <length> min-tile-w: 120px;
                             property <length> tile-h: 180px;
+                            property <length> cap-h: 18px;   // size caption row
                             property <length> gap: 8px;
                             property <int> columns: max(1, floor((self.width + self.gap) / (self.min-tile-w + self.gap)));
                             property <length> cell-w: (self.width - (self.columns - 1) * self.gap) / self.columns;
-                            property <length> row-h: self.tile-h + self.gap;
+                            property <length> cell-h: self.tile-h + self.cap-h;
+                            property <length> row-h: self.cell-h + self.gap;
                             property <int> row-count: root.posters.length > 0
                                 ? (root.posters.length + self.columns - 1) / self.columns
                                 : 0;
@@ -666,21 +926,38 @@ export component MainWindow inherits Window {
                                 x: mod(i, poster-grid.columns) * (poster-grid.cell-w + poster-grid.gap);
                                 y: floor(i / poster-grid.columns) * poster-grid.row-h;
                                 width: poster-grid.cell-w;
-                                height: poster-grid.tile-h;
-                                border-width: 1px;
-                                border-color: Theme.border;
-                                border-radius: 4px;
-                                clip: true;
-                                if poster.loaded: Image {
-                                    source: poster.image;
-                                    image-fit: contain;
-                                    width: 100%;
-                                    height: 100%;
-                                }
-                                if !poster.loaded: Text {
-                                    text: "…";
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
+                                height: poster-grid.cell-h;
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    // Thumbnail with a selection highlight border.
+                                    Rectangle {
+                                        height: poster-grid.tile-h;
+                                        border-width: root.selected-poster-index == i ? 3px : 1px;
+                                        border-color: root.selected-poster-index == i ? Theme.highlight : Theme.border;
+                                        border-radius: 4px;
+                                        clip: true;
+                                        if poster.loaded: Image {
+                                            source: poster.image;
+                                            image-fit: contain;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                        if !poster.loaded: Text {
+                                            text: "…";
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    // Size caption (e.g. "500 x 750").
+                                    Text {
+                                        height: poster-grid.cap-h;
+                                        text: poster.size;
+                                        color: Theme.muted-text;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                                 TouchArea {
                                     clicked => { root.poster-choice-clicked(i); }
@@ -707,7 +984,9 @@ export component MainWindow inherits Window {
                     vertical-stretch: 1;
                     for m[i] in root.matches: Rectangle {
                         height: 34px;
-                        background: touch.has-hover ? Theme.hover-row : transparent;
+                        background: root.selected-match-index == i
+                            ? Theme.highlight
+                            : (touch.has-hover ? Theme.hover-row : transparent);
                         touch := TouchArea {
                             enabled: !root.loading-details;
                             clicked => { root.select-match(i); }
@@ -717,6 +996,7 @@ export component MainWindow inherits Window {
                             padding-right: 6px;
                             Text {
                                 text: m.year == "" ? m.title : m.title + " (" + m.year + ")";
+                                color: root.selected-match-index == i ? Theme.highlight-text : Theme.text;
                                 vertical-alignment: center;
                                 overflow: elide;
                             }
@@ -745,7 +1025,11 @@ export component MainWindow inherits Window {
                 alignment: start;
                 spacing: 6px;
                 padding: 16px;
-                Image { source: root.app-icon; width: 96px; height: 96px; }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
                 Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
                 Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
                 Text { text: "©2026 Richard Lesh"; color: Theme.muted-text; horizontal-alignment: center; }
@@ -766,7 +1050,11 @@ export component MainWindow inherits Window {
                     font-weight: 700;
                     horizontal-alignment: center;
                 }
-                Button { text: "OK"; clicked => { root.about-ok(); } }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "OK"; min-width: 90px; clicked => { root.about-ok(); } }
+                }
             }
         }
     }
@@ -785,7 +1073,11 @@ export component MainWindow inherits Window {
                 alignment: start;
                 spacing: 6px;
                 padding: 16px;
-                Image { source: root.app-icon; width: 96px; height: 96px; }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
                 Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
                 Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
                 Text {
@@ -799,7 +1091,11 @@ export component MainWindow inherits Window {
                     url: "https://glowingcat.com/TagTiger.html";
                     open-url(u) => { root.open-url(u); }
                 }
-                Button { text: "Close"; clicked => { root.splash-dismiss(); } }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "Close"; min-width: 90px; clicked => { root.splash-dismiss(); } }
+                }
             }
         }
     }
@@ -929,28 +1225,7 @@ export component MainWindow inherits Window {
     }
 
     // ---- Save progress --------------------------------------------------
-    if root.show-progress: DialogScrim {
-        // No dismiss: a save in progress can't be cancelled from here.
-        Rectangle {
-            width: 380px;
-            height: prog-col.preferred-height + 32px;
-            background: Theme.card-bg;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: Theme.border;
-            prog-col := VerticalBox {
-                alignment: start;
-                spacing: 10px;
-                padding: 16px;
-                Text { text: "Rewriting file (moving media)…"; color: Theme.text; horizontal-alignment: center; }
-                ProgressIndicator {
-                    width: 100%;
-                    progress: root.progress-fraction;
-                }
-                if root.progress-caption != "": Text { text: root.progress-caption; color: Theme.muted-text; horizontal-alignment: center; }
-            }
-        }
-    }
+    // Save progress is shown inline in the top status panel (no dialog).
 
     // ---- Save complete --------------------------------------------------
     if root.show-complete: DialogScrim {

@@ -170,6 +170,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     // Platform-conditional Help menu item.
     window.set_show_install_cli(cfg!(target_os = "macos"));
+    window.set_is_macos(cfg!(target_os = "macos"));
 
     let posters: Rc<VecModel<PosterItem>> = Rc::new(VecModel::default());
     window.set_posters(ModelRc::from(posters.clone()));
@@ -579,8 +580,10 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         let handle = window.as_weak();
         window.on_poster_clicked(move || {
             if let Some(w) = handle.upgrade() {
-                // Toggle selection of the current poster (enables Cut/Copy).
+                // Toggle selection of the current poster (enables Cut/Copy) and
+                // clear any grid-tile selection.
                 w.set_poster_selected(!w.get_poster_selected());
+                w.set_selected_poster_index(-1);
             }
         });
     }
@@ -640,6 +643,12 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     // launch argument. Drained here since this runs on the UI thread every tick.
     #[cfg(target_os = "macos")]
     {
+        // Keep the native app-menu "About" pointed at our dialog (muda rebuilds
+        // the menu on property changes), and pick up clicks on it.
+        crate::macos_menu::enforce_about_override();
+        if crate::macos_menu::take_about_requested() {
+            w.set_show_about(true);
+        }
         for path in crate::macos_open::take_pending() {
             if is_movie_path(&path) && path.exists() {
                 let c = ctrl.borrow();
@@ -699,6 +708,8 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 w.set_file_loaded(true);
                 w.set_loading_details(false);
                 w.set_poster_selected(false);
+                w.set_selected_poster_index(-1);
+                w.set_selected_match_index(-1);
                 w.set_search_query(SharedString::from(suggested_query));
                 w.set_fast_start(fast_start);
                 set_matches(ctrl, w);
@@ -746,6 +757,7 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 }
                 let n = ctrl.borrow().results.len();
                 w.set_status(SharedString::from(format!("{n} match(es).")));
+                w.set_selected_match_index(-1);
                 set_matches(ctrl, w);
             }
             Event::DetailsDone { meta } => {
@@ -764,11 +776,18 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
             } => {
                 let c = ctrl.borrow();
                 if index < c.posters.row_count() {
+                    // Preserve the size caption set at placeholder creation.
+                    let size = c
+                        .posters
+                        .row_data(index)
+                        .map(|p| p.size)
+                        .unwrap_or_default();
                     c.posters.set_row_data(
                         index,
                         PosterItem {
                             image: rgba_to_image(width, height, &rgba),
                             loaded: true,
+                            size,
                         },
                     );
                 }
@@ -825,12 +844,13 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
             }
             Event::WriteStarted => {
                 ctrl.borrow_mut().write_is_shift = true;
-                w.set_status(SharedString::from("Saving (shifting media)…"));
+                w.set_progress_phase(SharedString::from("Copying"));
                 w.set_progress_fraction(0.0);
                 w.set_progress_caption(SharedString::from(""));
                 w.set_show_progress(true);
             }
-            Event::WriteProgress(done, total) => {
+            Event::WriteProgress(phase, done, total) => {
+                w.set_progress_phase(SharedString::from(phase));
                 let frac = if total > 0 {
                     done as f32 / total as f32
                 } else {
@@ -906,6 +926,7 @@ fn select_match(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
     };
     ctrl.borrow_mut().loading_details = true;
     w.set_loading_details(true);
+    w.set_selected_match_index(idx as i32);
     w.set_status(SharedString::from("Loading details…"));
     let c = ctrl.borrow();
     let _ = c.worker.tx.send(Request::FetchDetails { id, file });
@@ -1151,6 +1172,9 @@ fn poster_choice_clicked(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i3
             .map(|a| a.url.clone())
     };
     if let Some(url) = url {
+        // Select this grid tile (highlight) and clear the current-cover
+        // selection; the chosen poster becomes the current cover.
+        w.set_selected_poster_index(idx as i32);
         w.set_poster_selected(false);
         w.set_status(SharedString::from("Setting poster…"));
         let c = ctrl.borrow();
@@ -1218,10 +1242,12 @@ fn load_meta(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, meta: MediaMetadata
     {
         let c = ctrl.borrow();
         c.posters.set_vec(
-            (0..n)
-                .map(|_| PosterItem {
+            meta.artwork
+                .iter()
+                .map(|art| PosterItem {
                     image: slint::Image::default(),
                     loaded: false,
+                    size: SharedString::from(size_caption(art.width.zip(art.height))),
                 })
                 .collect::<Vec<_>>(),
         );

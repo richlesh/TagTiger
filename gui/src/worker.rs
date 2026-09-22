@@ -109,8 +109,8 @@ pub enum Event {
     },
     /// A shift-save started (streaming media to a temp file).
     WriteStarted,
-    /// Progress of a shift-save: (bytes_done, bytes_total).
-    WriteProgress(u64, u64),
+    /// Progress of a shift-save: (phase_label, bytes_done, bytes_total).
+    WriteProgress(&'static str, u64, u64),
     Error(String),
 }
 
@@ -286,12 +286,12 @@ async fn handle(
             // A shift save streams the media with progress; an in-place save
             // never calls the progress callback. Announce a start only once.
             let mut announced = false;
-            let mut on_progress = |done: u64, total: u64| {
+            let mut on_progress = |phase: tag::WritePhase, done: u64, total: u64| {
                 if !announced {
                     announced = true;
                     let _ = evt_tx.send(Event::WriteStarted);
                 }
-                let _ = evt_tx.send(Event::WriteProgress(done, total));
+                let _ = evt_tx.send(Event::WriteProgress(phase.label(), done, total));
                 repaint();
             };
             tag::write_to_file_with_progress(
