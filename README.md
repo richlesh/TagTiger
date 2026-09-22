@@ -7,8 +7,7 @@ media kind, HD/4K definition, studio, the `iTunMOVI` cast/director/producer/
 screenwriter plist, cover art, and TV atoms.
 
 Written in Rust. No external command-line tools are required at runtime — MP4
-atom writing is done in-process via the pure-Rust `mp4ameta` crate. It ships as
-a single native binary per platform (Linux, macOS, Windows on x86-64 and ARM64).
+atom writing is done in-process via the pure-Rust `mp4ameta` crate. It ships as native binaries for Linux (x86-64 and ARM64), macOS (Apple Silicon only), and Windows (x86-64 and ARM64), without external runtime tagging tools.
 
 The desktop GUI is a full metadata editor: search TMDB, pick from a poster grid,
 edit every field (with per-field locks, undo/redo, and paste/drop of custom
@@ -21,6 +20,7 @@ poster art), choose the video definition, and toggle a **fast-start**
 core/   library — domain model, MP4 atom tagging, providers, naming, artwork
 cli/    thin command-line frontend (binary: tagtiger)
 gui/    Slint desktop app (binary: tagtiger-gui): metadata editor + poster grid
+launch/ macOS launcher shim for Finder/Open With and dock-launch file handling
 ```
 
 The design keeps concerns decoupled:
@@ -34,12 +34,12 @@ The design keeps concerns decoupled:
 
 ## Building
 
-Requires a recent stable Rust toolchain.
+Requires Rust **1.75 or newer** (stable).
 
 ```sh
 cargo build --release            # builds all crates
 cargo run -p tagtiger-cli -- --help
-cargo run -p tagtiger-gui          # launch the GUI
+cargo run -p tagtiger-gui        # launch the GUI
 ```
 
 ### Linux build dependencies (GUI)
@@ -58,32 +58,27 @@ packages above cover it.
 
 ## Usage (CLI)
 
-Set a TMDB credential first. Preferred is a **v4 read access token** (Bearer):
+Set a TMDB credential first using a **v4 read access token** (Bearer):
 
 ```sh
 export TMDB_BEARER_TOKEN=your_v4_read_access_token
 ```
 
-Alternatively, a legacy **v3 API key** is still supported as a fallback:
-
-```sh
-export TMDB_API_KEY=your_v3_api_key
-```
-
-Both are found in your TMDB account under Settings → API. If both are set,
-the Bearer token takes precedence.
+TMDb calls use v3 REST endpoints; the API
+Read Access Token is sent as a Bearer token and works with those endpoints.
 
 ```sh
 tagtiger search  "The Matrix (1999).mp4"      # parse name + list TMDB matches
 tagtiger inspect movie.m4v                     # show existing tags (all fields)
 tagtiger tag     "The Matrix (1999).mp4" --id 603   # fetch + write tags (+poster)
+tagtiger tag     movie.m4v --id 603 --no-artwork       # write metadata only
 ```
 
 `inspect` prints the full set of tags read back from the file — title, release
 date, media kind, definition, rating, genres, studio, directors, cast,
 producers, screenwriters, summary, long description, and whether cover art is
-present. `tag` preserves the file's existing fast-start layout and, when TMDB
-doesn't supply a definition, deduces it from the video track's dimensions.
+present. `tag` preserves the file's existing fast-start layout. 
+Definition atom is deduced from the video track's dimensions.
 
 ## Usage (GUI)
 
@@ -91,7 +86,9 @@ doesn't supply a definition, deduces it from the video track's dimensions.
 cargo run -p tagtiger-gui          # or run the packaged binary
 ```
 
-The GUI is a full editor. Open an MP4/M4V (File ▸ Open…, an "Open With" launch,
+The GUI is a full editor. Set a TMDb API Read Access Token in **Settings**
+if you do not want to use environment variables; the saved token takes precedence
+over `TMDB_BEARER_TOKEN`. Open an MP4/M4V (File ▸ Open…, an "Open With" launch,
 or — on macOS — by dropping a file onto the window or dock icon), search TMDB,
 and pick a poster from the grid. Every field is editable with a per-field
 **Lock** (locked fields aren't overwritten when you select a different match),
@@ -102,7 +99,8 @@ saved web-optimized (`moov` before `mdat`) or with `moov` last. The
 window/dock/taskbar icon and, on macOS/Windows, the executable and installer
 icons are bundled.
 
-> **Note on drag-and-drop:** dragging files from the file manager onto the
+> [!NOTE]
+> Dragging files from the file manager onto the
 > window is supported on **macOS** only. On Windows and Linux, receiving OS file
 > drops is not yet available in the Slint GUI toolkit (pending upstream support
 > in winit); use File ▸ Open…, the "Open file…" button, an "Open With" launch,
@@ -110,10 +108,9 @@ icons are bundled.
 
 ### License
 
-TagTiger is donationware. Enter a license key via **Help ▸ License Key…** (email
-+ key); it's validated and saved to `~/.tagtiger-settings.json`. A valid license
+TagTiger is donationware. Enter a license key via **Help ▸ License Key…** (email + key); it's validated and saved to `~/.tagtiger-settings.json`. A valid license
 suppresses the startup splash and shows a thank-you in **Help ▸ About**.
-Unlicensed use shows the splash on startup and again every 10 tag-write
+Unlicensed use shows the splash on startup and again every 5 tag-write
 operations.
 
 ## Metadata written
@@ -139,11 +136,11 @@ CI builds five targets and publishes them on tagged releases (`vX.Y.Z`):
 | OS      | x86-64                        | ARM64                          |
 |---------|-------------------------------|--------------------------------|
 | Linux   | `x86_64-unknown-linux-gnu`    | `aarch64-unknown-linux-gnu`    |
-| macOS   | — (use ARM64 via Rosetta 2)   | `aarch64-apple-darwin`         |
-| Windows | `x86_64-pc-windows-msvc`      | `aarch64-pc-windows-msvc`      |
+| macOS   | Not built/supported           | `aarch64-apple-darwin`         |
+| Windows | `x64-Setup`      | `arm64-Setup`      |
 
-Linux releases include `.deb` and `.rpm` packages in addition to a `.tar.gz`.
-A single Linux binary per architecture runs on both Debian- and Red Hat-family
+Linux releases include `.deb` and `.rpm` packages.
+A single Linux binary per architecture runs on both Debian and Red Hat
 distributions; the `-gnu` builds are produced on an older Ubuntu image to keep
 the glibc requirement low. macOS ships a notarized `.dmg` containing the
 `TagTiger.app` (with the `tagtiger` CLI inside it at
