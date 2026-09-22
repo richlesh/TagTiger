@@ -119,8 +119,10 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev libxkbcommon-dev
 
-      # For aarch64 Linux we use `cross`, which builds inside a container that
-      # carries the correct cross sysroot and GUI libs.
+      # For aarch64 Linux we use `cross`, which builds inside a container with
+      # the correct cross sysroot. The target-arch GUI system libraries
+      # (fontconfig, X11, xkbcommon, GL) are installed into that container by
+      # the pre-build hook in Cross.toml.
       - name: Install cross
         if: matrix.cross == true
         run: cargo install cross --locked
