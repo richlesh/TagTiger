@@ -579,6 +579,7 @@ export component MainWindow inherits Window {
             title: "File";
             MenuItem {
                 title: "Open…";
+                enabled: !root.writing;
                 shortcut: @keys(Control + O);
                 activated => { root.open-file(); }
             }
@@ -590,7 +591,7 @@ export component MainWindow inherits Window {
             }
             MenuItem {
                 title: "Search TMDB";
-                enabled: root.file-loaded;
+                enabled: root.file-loaded && !root.writing;
                 shortcut: @keys(Control + F);
                 activated => { root.do-search(); }
             }
@@ -677,6 +678,8 @@ export component MainWindow inherits Window {
             IconButton {
                 icon: @image-url("icons/folder-open.svg");
                 tooltip: "Open File";
+                // Blocked while a tag-write is in progress.
+                enabled: !root.writing;
                 clicked => { root.open-file(); }
             }
             IconButton {
@@ -782,25 +785,32 @@ export component MainWindow inherits Window {
                             // Search button: highlights in the system highlight
                             // color on hover (the std Button shows no hover state
                             // in the native macOS style), mirroring IconButton.
+                            // Disabled while a tag-write is in progress.
                             Rectangle {
+                                property <bool> enabled: !root.writing;
                                 width: 34px;
                                 height: 30px;
                                 border-radius: 5px;
                                 border-width: 1px;
-                                border-color: search-touch.has-hover ? Theme.highlight : Theme.border;
-                                background: search-touch.pressed
-                                    ? Theme.highlight.darker(0.2)
-                                    : (search-touch.has-hover ? Theme.highlight : transparent);
+                                border-color: (self.enabled && search-touch.has-hover) ? Theme.highlight : Theme.border;
+                                background: !self.enabled
+                                    ? transparent
+                                    : (search-touch.pressed
+                                        ? Theme.highlight.darker(0.2)
+                                        : (search-touch.has-hover ? Theme.highlight : transparent));
                                 Image {
                                     source: @image-url("icons/magnifying-glass.svg");
-                                    colorize: search-touch.has-hover ? Theme.highlight-text : Theme.text;
+                                    colorize: !parent.enabled
+                                        ? Theme.muted-text
+                                        : (search-touch.has-hover ? Theme.highlight-text : Theme.text);
                                     width: 20px;
                                     height: 20px;
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                 }
                                 search-touch := TouchArea {
-                                    mouse-cursor: pointer;
+                                    enabled: parent.enabled;
+                                    mouse-cursor: parent.enabled ? MouseCursor.pointer : MouseCursor.default;
                                     clicked => { root.do-search(); }
                                 }
                                 Tooltip { text: @markdown("Search TMDB"); }
@@ -917,24 +927,28 @@ export component MainWindow inherits Window {
                                     label: "Directors (comma-sep)";
                                     value <=> root.directors-text;
                                     locked <=> root.lock-directors;
+                                    input-height: 72px;
                                     edited => { root.field-edited(); }
                                 }
                                 PeopleRow {
                                     label: "Cast (comma-sep)";
                                     value <=> root.cast-text;
                                     locked <=> root.lock-cast;
+                                    input-height: 72px;
                                     edited => { root.field-edited(); }
                                 }
                                 PeopleRow {
                                     label: "Producers (comma-sep)";
                                     value <=> root.producers-text;
                                     locked <=> root.lock-producers;
+                                    input-height: 72px;
                                     edited => { root.field-edited(); }
                                 }
                                 PeopleRow {
                                     label: "Screenwriters (comma-sep)";
                                     value <=> root.writers-text;
                                     locked <=> root.lock-writers;
+                                    input-height: 72px;
                                     edited => { root.field-edited(); }
                                 }
                                 FieldRow {
@@ -1154,14 +1168,14 @@ export component MainWindow inherits Window {
     if root.show-about: DialogScrim {
         dismiss => { root.about-ok(); }
         Rectangle {
-            width: 320px;
+            width: 280px;
             height: about-col.preferred-height + 32px;
             background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
             border-color: Theme.border;
             about-col := VerticalBox {
-                alignment: start;
+                alignment: center;
                 spacing: 6px;
                 padding: 16px;
                 HorizontalBox {
@@ -1202,14 +1216,14 @@ export component MainWindow inherits Window {
     if root.show-splash: DialogScrim {
         dismiss => { root.splash-dismiss(); }
         Rectangle {
-            width: 340px;
+            width: 280px;
             height: splash-col.preferred-height + 32px;
             background: Theme.card-bg;
             border-radius: 10px;
             border-width: 1px;
             border-color: Theme.border;
             splash-col := VerticalBox {
-                alignment: start;
+                alignment: center;
                 spacing: 6px;
                 padding: 16px;
                 HorizontalBox {
@@ -1219,11 +1233,16 @@ export component MainWindow inherits Window {
                 }
                 Text { text: "TagTiger"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
                 Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
-                Text {
-                    text: "If you enjoy using this product please consider donating to help fund this and other open source projects.";
-                    color: Theme.text;
-                    wrap: word-wrap;
-                    horizontal-alignment: center;
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Text {
+                        text: "If you enjoy using this product please consider donating to help fund this and other open source projects.";
+                        color: Theme.text;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        max-width: 200px;
+                    }
                 }
                 Hyperlink {
                     text: "Donate at Glowing Cat Software";
