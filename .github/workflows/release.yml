@@ -1,12 +1,12 @@
 name: Release
 
 on:
-  # Manual release: provide the version (e.g. 1.0.0 or v1.0.0). The tag is
+  # Manual release: provide the version (e.g. 1.1.0). The tag is
   # created and pushed by the workflow if it doesn't already exist.
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 1.0.0 or v1.0.0)"
+        description: "Release version (e.g. 1.1.0)"
         required: true
   # Also still runs when a matching tag is pushed directly.
   push:
