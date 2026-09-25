@@ -2955,7 +2955,7 @@ fn dims_caption(size: Option<(u32, u32)>) -> String {
 // ---------------------------------------------------------------------------
 
 /// US movie (MPAA) content ratings.
-const MOVIE_RATINGS: &[&str] = &["G", "PG", "PG-13", "R", "NC-17", "Not Rated", "Unrated"];
+const MOVIE_RATINGS: &[&str] = &["G", "PG", "PG-13", "R", "NC-17", "Not Rated"];
 /// US TV content ratings.
 const TV_RATINGS: &[&str] = &["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
 

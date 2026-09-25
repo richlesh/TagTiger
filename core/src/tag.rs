@@ -549,7 +549,6 @@ const ITUNEXTC_MOVIE: &[(&str, &str)] = &[
     ("R", "400"),
     ("NC-17", "500"),
     ("Not Rated", "0"),
-    ("Unrated", "0"),
 ];
 const ITUNEXTC_TV: &[(&str, &str)] = &[
     ("TV-Y", "100"),
@@ -588,6 +587,9 @@ fn decode_itunextc(raw: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     match label {
+        // Legacy files may carry the old "Unrated" label; it collapsed into
+        // "Not Rated", so map it there for display/round-trip.
+        Some(l) if l.eq_ignore_ascii_case("Unrated") => Some("Not Rated".to_string()),
         Some(l) => Some(l.to_string()),
         None => Some(raw.to_string()),
     }
@@ -700,6 +702,22 @@ mod tests {
         // Decoding then matching should yield a menu value.
         let enc = encode_itunextc("R").unwrap();
         assert_eq!(decode_itunextc(&enc).as_deref(), Some("R"));
+
+        // "Not Rated" is the single collapsed entry; "Unrated" no longer
+        // encodes, but legacy files carrying it decode back to "Not Rated".
+        assert_eq!(
+            encode_itunextc("Not Rated").as_deref(),
+            Some("mpaa|Not Rated|0|")
+        );
+        assert_eq!(encode_itunextc("Unrated"), None);
+        assert_eq!(
+            decode_itunextc("mpaa|Unrated|0|").as_deref(),
+            Some("Not Rated")
+        );
+        assert_eq!(
+            decode_itunextc("mpaa|Not Rated|0|").as_deref(),
+            Some("Not Rated")
+        );
     }
 
     #[test]
