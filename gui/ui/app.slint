@@ -555,6 +555,10 @@ export component MainWindow inherits Window {
 
     // ---- Matches (TMDB search results) --------------------------------
     in property <[MatchItem]> matches;
+    // Width of the right-hand Matches panel, adjustable by dragging the divider
+    // between the editor and the panel. Clamped to a sensible range in the drag
+    // handler.
+    in-out property <length> matches-width: 300px;
     // Index of the selected match row (-1 = none), highlighted in the list.
     in property <int> selected-match-index: -1;
 
@@ -829,7 +833,7 @@ export component MainWindow inherits Window {
         }
 
         // Main body: editor (left) + matches (right).
-        HorizontalBox {
+        body := HorizontalBox {
             padding: 0px;
             spacing: 10px;
             vertical-stretch: 1;
@@ -1281,9 +1285,44 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // ---- Draggable divider ------------------------------------
+            // A thin handle between the editor and the Matches panel. Dragging
+            // it left/right resizes the Matches panel (and the editor takes the
+            // rest). Width is clamped so neither panel collapses.
+            Rectangle {
+                width: 6px;
+                // Track the Matches width at the moment the drag began.
+                property <length> start-width: root.matches-width;
+                Rectangle {
+                    // A subtle visible grip line, brighter while hovered/pressed.
+                    width: 2px;
+                    x: (parent.width - self.width) / 2;
+                    background: (divider-touch.has-hover || divider-touch.pressed)
+                        ? Theme.highlight
+                        : Theme.hairline;
+                }
+                divider-touch := TouchArea {
+                    mouse-cursor: ew-resize;
+                    moved => {
+                        if self.pressed {
+                            // Dragging right shrinks Matches; left grows it.
+                            let delta = self.mouse-x - self.pressed-x;
+                            let raw = parent.start-width - delta;
+                            let max-w = max(200px, body.width - 360px);
+                            root.matches-width = clamp(raw, 200px, max-w);
+                        }
+                    }
+                    pointer-event(ev) => {
+                        if ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down {
+                            parent.start-width = root.matches-width;
+                        }
+                    }
+                }
+            }
+
             // ---- Right: matches ---------------------------------------
             VerticalBox {
-                width: 300px;
+                width: root.matches-width;
                 padding: 0px;
                 spacing: 6px;
                 Text { text: "Matches"; font-size: 16px; font-weight: 700; }
