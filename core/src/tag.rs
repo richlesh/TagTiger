@@ -559,6 +559,26 @@ const ITUNEXTC_TV: &[(&str, &str)] = &[
     ("TV-MA", "600"),
 ];
 
+/// All accepted content-rating labels (US movie/MPAA first, then US TV), in
+/// menu order. This is the single source of truth for valid rating values.
+pub fn content_ratings() -> Vec<&'static str> {
+    ITUNEXTC_MOVIE
+        .iter()
+        .chain(ITUNEXTC_TV.iter())
+        .map(|(label, _)| *label)
+        .collect()
+}
+
+/// Whether `rating` is a recognized content-rating label (case-sensitive,
+/// trimmed), i.e. one that `iTunEXTC` encoding supports.
+pub fn is_valid_content_rating(rating: &str) -> bool {
+    let r = rating.trim();
+    ITUNEXTC_MOVIE
+        .iter()
+        .chain(ITUNEXTC_TV.iter())
+        .any(|(label, _)| *label == r)
+}
+
 /// Encode a plain rating value (as shown in the menu) into the Apple
 /// `iTunEXTC` string, e.g. `PG-13` -> `mpaa|PG-13|300|`. Returns `None` for an
 /// unrecognized value.
@@ -789,5 +809,26 @@ mod tests {
             fourcc_utf8(&tag, ATOM_TV_EPISODE_ID).as_deref(),
             Some("Pilot")
         );
+    }
+
+    #[test]
+    fn content_rating_validation() {
+        // A few known movie and TV labels are accepted.
+        assert!(is_valid_content_rating("PG-13"));
+        assert!(is_valid_content_rating("R"));
+        assert!(is_valid_content_rating("Not Rated"));
+        assert!(is_valid_content_rating("TV-MA"));
+        // Trimmed input is accepted.
+        assert!(is_valid_content_rating("  PG  "));
+        // Unknown / removed labels are rejected.
+        assert!(!is_valid_content_rating("Unrated"));
+        assert!(!is_valid_content_rating("BOGUS"));
+        assert!(!is_valid_content_rating(""));
+        // The list covers movie then TV labels and each one validates.
+        let all = content_ratings();
+        assert!(all.contains(&"G") && all.contains(&"TV-MA"));
+        for r in &all {
+            assert!(is_valid_content_rating(r));
+        }
     }
 }

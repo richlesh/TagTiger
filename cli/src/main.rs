@@ -2,8 +2,11 @@
 //!
 //! Subcommands:
 //!   tagtiger search  <file>            Parse filename, search TMDB, list matches.
+//!   tagtiger search  <show> <title>    Search a TV show's episodes by title
+//!                                      (Show → Season → Episode results).
 //!   tagtiger inspect <file>            Print existing tags in a file.
 //!   tagtiger tag     <file> --id <id>  Fetch details for a TMDB id and write tags.
+//!   tagtiger tag     <file> --rating <R>  Set only the content rating in place.
 //!
 //! Requires a TMDB credential for network commands: set `TMDB_BEARER_TOKEN`
 //! (a v4 read access token, preferred) or `TMDB_API_KEY` (a v3 API key).
@@ -30,16 +33,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse a filename and list matching titles from TMDB.
-    Search { file: PathBuf },
+    /// Search TMDB. With one argument, parse it as a filename and list matching
+    /// titles. With two arguments, the first is a TV show name and the second
+    /// is an episode title to find (results shown as Show → Season → Episode).
+    #[command(
+        override_usage = "tagtiger search <FILE>\n       tagtiger search <TV SHOW> <EPISODE TITLE>",
+        after_help = "EXAMPLES:\n  \
+            tagtiger search \"The Matrix (1999).mp4\"      Parse the filename and list movie matches\n  \
+            tagtiger search \"Breaking Bad\" \"Pilot\"       List episodes titled \"Pilot\" (Show > Season > Episode)"
+    )]
+    Search {
+        /// One filename, or two strings: <TV show> <episode title>.
+        #[arg(required = true, num_args = 1..=2)]
+        args: Vec<String>,
+    },
     /// Print existing metadata found in a file.
     Inspect { file: PathBuf },
-    /// Fetch details for a provider id and write tags into the file.
+    /// Write tags into a file. With --id, fetch full metadata from TMDB and
+    /// write it. With --rating (and no --id), set just the content rating,
+    /// leaving all other tags untouched (no TMDB lookup needed).
     Tag {
         file: PathBuf,
         /// TMDB id to fetch.
         #[arg(long)]
-        id: String,
+        id: Option<String>,
+        /// Set only the content rating (e.g. PG-13, R, TV-MA, Not Rated).
+        /// Used without --id to update just the rating in place.
+        #[arg(long)]
+        rating: Option<String>,
         /// Treat the id as a TV show rather than a movie.
         #[arg(long)]
         tv: bool,
@@ -64,19 +85,36 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Search { file } => search(file).await,
+        Command::Search { args } => search(args).await,
         Command::Inspect { file } => inspect(file),
         Command::Tag {
             file,
             id,
+            rating,
             tv,
             no_artwork,
-        } => tag_file(file, id, tv, no_artwork).await,
+        } => tag_file(file, id, rating, tv, no_artwork).await,
     }
 }
 
-async fn search(file: PathBuf) -> Result<()> {
+async fn search(args: Vec<String>) -> Result<()> {
     let provider = TmdbProvider::from_env().context("Set TMDB_BEARER_TOKEN or TMDB_API_KEY")?;
+    match args.as_slice() {
+        // Two strings: <TV show> <episode title>. Search the show's episodes by
+        // title and print the Show → Season → Episode hierarchy.
+        [show, title] => search_episode_by_title(&provider, show, title).await,
+        // One string: parse it as a filename and search movies/episodes.
+        [file] => search_by_filename(&provider, PathBuf::from(file)).await,
+        // clap enforces 1..=2 args, so this is unreachable in practice.
+        _ => {
+            anyhow::bail!("search takes a filename, or a TV show name and an episode title")
+        }
+    }
+}
+
+/// Parse a filename and list matching titles from TMDB (movie or episode per
+/// the parsed kind).
+async fn search_by_filename(provider: &TmdbProvider, file: PathBuf) -> Result<()> {
     let query = naming::parse(&file)?;
     println!(
         "Parsed: title={:?} year={:?} kind={:?}",
@@ -100,6 +138,28 @@ async fn search(file: PathBuf) -> Result<()> {
                 .take(80)
                 .collect::<String>()
         );
+    }
+    Ok(())
+}
+
+/// Search a TV show's episodes by title across all matching shows and seasons,
+/// printing the results as a Show → Season → Episode hierarchy.
+async fn search_episode_by_title(provider: &TmdbProvider, show: &str, title: &str) -> Result<()> {
+    println!("Searching “{show}” episodes matching “{title}”…");
+    let shows = provider.search_episode_tree_by_title(show, title).await?;
+    if shows.is_empty() {
+        println!("No matching episodes.");
+        return Ok(());
+    }
+    for s in shows {
+        let year = s.year.map(|y| format!(" ({y})")).unwrap_or_default();
+        println!("{}{}  [{}]", s.show_name, year, s.series_id);
+        for season in s.seasons {
+            println!("  {} (season {})", season.name, season.season_number);
+            for ep in season.episodes {
+                println!("    {}: {}", ep.number, ep.name);
+            }
+        }
     }
     Ok(())
 }
@@ -191,7 +251,34 @@ fn inspect(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn tag_file(file: PathBuf, id: String, tv: bool, no_artwork: bool) -> Result<()> {
+async fn tag_file(
+    file: PathBuf,
+    id: Option<String>,
+    rating: Option<String>,
+    tv: bool,
+    no_artwork: bool,
+) -> Result<()> {
+    // Validate a supplied rating up front against the accepted labels.
+    if let Some(r) = rating.as_deref() {
+        let r = r.trim();
+        if !tag::is_valid_content_rating(r) {
+            anyhow::bail!(
+                "unknown rating {r:?}; valid ratings: {}",
+                tag::content_ratings().join(", ")
+            );
+        }
+    }
+
+    // Rating-only mode: with --rating and no --id, set just the content rating
+    // in place, leaving all other tags untouched. No TMDB lookup needed.
+    if id.is_none() {
+        let Some(rating) = rating else {
+            anyhow::bail!("tag requires --id (fetch from TMDB) or --rating (set rating only)");
+        };
+        return set_rating_only(file, rating.trim().to_string());
+    }
+    let id = id.expect("id is Some in the fetch path");
+
     let provider = TmdbProvider::from_env().context("Set TMDB_BEARER_TOKEN or TMDB_API_KEY")?;
     let kind = if tv {
         MediaKind::TvShow
@@ -248,10 +335,35 @@ async fn tag_file(file: PathBuf, id: String, tv: bool, no_artwork: bool) -> Resu
         }
     }
 
+    // An explicit --rating overrides the fetched content rating.
+    if let Some(r) = rating {
+        meta.content_rating = Some(r.trim().to_string());
+    }
+
     // Preserve the file's existing layout: keep a fast-start file fast-start,
     // and a moov-last file moov-last.
     let fast_start = tagtiger_core::mp4rewrite::is_fast_start(&file).unwrap_or(false);
     tag::write_to_file(&file, &meta, encoded.as_ref(), fast_start)?;
     println!("Wrote tags to {}", file.display());
+    Ok(())
+}
+
+/// Set only the content rating in place: read the file's existing metadata,
+/// replace the rating, and write it back, preserving all other tags, the cover
+/// art, and the fast-start layout. No TMDB access.
+fn set_rating_only(file: PathBuf, rating: String) -> Result<()> {
+    let (mut meta, cover) = tag::read_from_file(&file)
+        .with_context(|| format!("reading tags from {}", file.display()))?;
+    meta.content_rating = Some(rating.clone());
+
+    // Re-embed the existing cover (if any) so the write preserves it.
+    let encoded = match cover {
+        Some(bytes) => Some(artwork::normalize_for_cover(&bytes)?),
+        None => None,
+    };
+
+    let fast_start = tagtiger_core::mp4rewrite::is_fast_start(&file).unwrap_or(false);
+    tag::write_to_file(&file, &meta, encoded.as_ref(), fast_start)?;
+    println!("Set rating to {rating} in {}", file.display());
     Ok(())
 }
