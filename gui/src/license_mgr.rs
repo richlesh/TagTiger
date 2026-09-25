@@ -268,7 +268,10 @@ mod tests {
         // Index round-trips through the string mapping.
         for i in 0..=3 {
             let name = Settings::font_size_from_index(i);
-            let s = Settings { font_size: name, ..Default::default() };
+            let s = Settings {
+                font_size: name,
+                ..Default::default()
+            };
             assert_eq!(s.font_size_index(), i);
         }
     }

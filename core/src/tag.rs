@@ -748,7 +748,10 @@ mod tests {
         assert_eq!(fourcc_be_i32(&tag, ATOM_TV_SEASON), Some(1));
         assert_eq!(fourcc_be_i32(&tag, ATOM_TV_EPISODE), Some(2));
         // With no override, the Episode ID is derived from season/episode.
-        assert_eq!(fourcc_utf8(&tag, ATOM_TV_EPISODE_ID).as_deref(), Some("1x02"));
+        assert_eq!(
+            fourcc_utf8(&tag, ATOM_TV_EPISODE_ID).as_deref(),
+            Some("1x02")
+        );
     }
 
     #[test]

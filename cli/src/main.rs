@@ -170,10 +170,19 @@ fn inspect(file: PathBuf) -> Result<()> {
     );
     // TV Show fields, when the file carries episode metadata.
     if let MediaKindMeta::Episode(ep) = &meta.kind {
-        println!("Show:         {}", if ep.show_name.is_empty() { "(none)".into() } else { ep.show_name.clone() });
+        println!(
+            "Show:         {}",
+            if ep.show_name.is_empty() {
+                "(none)".into()
+            } else {
+                ep.show_name.clone()
+            }
+        );
         println!(
             "Episode ID:   {}",
-            ep.episode_id.clone().unwrap_or_else(|| format!("{}x{:02}", ep.season, ep.episode))
+            ep.episode_id
+                .clone()
+                .unwrap_or_else(|| format!("{}x{:02}", ep.season, ep.episode))
         );
         println!("Season:       {}", ep.season);
         println!("Episode:      {}", ep.episode);

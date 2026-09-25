@@ -719,10 +719,7 @@ fn episode_title_matches(name: Option<&str>, needle_lower: &str) -> bool {
 /// Filter a season's `(episode_number, name)` list to the episodes matching a
 /// lowercased title needle, producing `TvEpisodeHit`s. An empty needle keeps
 /// every episode.
-fn filter_matching_episodes(
-    episodes: Vec<(u32, String)>,
-    needle_lower: &str,
-) -> Vec<TvEpisodeHit> {
+fn filter_matching_episodes(episodes: Vec<(u32, String)>, needle_lower: &str) -> Vec<TvEpisodeHit> {
     episodes
         .into_iter()
         .filter(|(_, name)| episode_title_matches(Some(name.as_str()), needle_lower))
@@ -1246,7 +1243,10 @@ mod tests {
         let season: TmdbSeasonDetail = serde_json::from_str(json).unwrap();
         assert_eq!(season.episodes.len(), 2);
         assert_eq!(season.episodes[0].episode_number, 1);
-        assert_eq!(season.episodes[1].name.as_deref(), Some("Cat's in the Bag..."));
+        assert_eq!(
+            season.episodes[1].name.as_deref(),
+            Some("Cat's in the Bag...")
+        );
         assert!(season.episodes[1].still_path.is_none());
     }
 

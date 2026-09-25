@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tagtiger_core::{
     artwork::{self, EncodedArtwork},
     model::{
-        MediaKind, MediaKindMeta, MediaMetadata, MediaQuery, ProviderId, SearchResult,
-        TvSeasonSummary, TvShowMatch, Artwork,
+        Artwork, MediaKind, MediaKindMeta, MediaMetadata, MediaQuery, ProviderId, SearchResult,
+        TvSeasonSummary, TvShowMatch,
     },
     naming, tag, MetadataProvider, TmdbProvider,
 };
@@ -386,7 +386,10 @@ async fn handle(
         Request::FetchShowPosters { series_id } => {
             let provider =
                 provider.ok_or_else(|| anyhow::anyhow!("Set TMDB_BEARER_TOKEN or TMDB_API_KEY"))?;
-            let artwork = provider.tv_show_posters(&series_id).await.unwrap_or_default();
+            let artwork = provider
+                .tv_show_posters(&series_id)
+                .await
+                .unwrap_or_default();
             Ok(Some(Event::ShowPostersReady { series_id, artwork }))
         }
         Request::FetchSeasonEpisodes { series_id, season } => {
@@ -445,10 +448,16 @@ async fn handle(
                     let lookups = results.iter().take(MAX_ENRICH).map(|r| {
                         let provider = provider.clone();
                         let id = r.id.id.clone();
-                        async move { provider.episode_name(&id, season, episode).await.ok().flatten() }
+                        async move {
+                            provider
+                                .episode_name(&id, season, episode)
+                                .await
+                                .ok()
+                                .flatten()
+                        }
                     });
                     let names = futures::future::join_all(lookups).await;
-                    for (r, name) in results.iter_mut().zip(names.into_iter()) {
+                    for (r, name) in results.iter_mut().zip(names) {
                         r.id.season = Some(season);
                         r.id.episode = Some(episode);
                         r.episode_name = name;
