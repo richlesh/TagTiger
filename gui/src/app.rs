@@ -208,6 +208,9 @@ struct Controller {
     /// Font Size index (0=System) when the Settings dialog was opened, so
     /// Cancel can revert a live preview.
     font_index_before_settings: i32,
+    /// One-shot timer that auto-dismisses the "Update complete" dialog after a
+    /// few seconds. Held so it lives long enough to fire.
+    complete_timer: slint::Timer,
 }
 
 /// Build the window, wire up the worker + callbacks, and run the event loop.
@@ -273,6 +276,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         font_index_before_settings: 0,
         show_poster_cache: std::collections::HashMap::new(),
         active_poster_show: None,
+        complete_timer: slint::Timer::default(),
     }));
 
     // App version + icon for the dialogs.
@@ -526,12 +530,7 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         let handle = window.as_weak();
         move || {
             if let Some(w) = handle.upgrade() {
-                w.set_show_complete(false);
-                // Show a deferred donation splash now the dialog is dismissed.
-                if ctrl.borrow().splash_pending {
-                    ctrl.borrow_mut().splash_pending = false;
-                    w.set_show_splash(true);
-                }
+                dismiss_complete_dialog(&ctrl, &w);
             }
         }
     });
@@ -1259,6 +1258,21 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 w.set_status(SharedString::from(format!("Saved: {name}")));
                 w.set_complete_msg(SharedString::from(format!("“{name}” was {how}.")));
                 w.set_show_complete(true);
+                // Auto-dismiss the completion dialog after 3 seconds (the OK
+                // button still dismisses immediately).
+                {
+                    let ctrl2 = ctrl.clone();
+                    let handle = w.as_weak();
+                    ctrl.borrow().complete_timer.start(
+                        slint::TimerMode::SingleShot,
+                        Duration::from_secs(3),
+                        move || {
+                            if let Some(w) = handle.upgrade() {
+                                dismiss_complete_dialog(&ctrl2, &w);
+                            }
+                        },
+                    );
+                }
             }
             Event::WriteStarted => {
                 ctrl.borrow_mut().write_is_shift = true;
@@ -1849,6 +1863,18 @@ fn set_cover_bytes(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, bytes: Option
 /// highlights and progress bar match the user's chosen OS colors. Falls back to
 /// Slint's Palette defaults (`has-sys-colors` false) when the OS colors can't
 /// be read (e.g. a Linux desktop without an accent-color portal setting).
+/// Dismiss the "Update complete" dialog and cancel its auto-dismiss timer,
+/// then show a deferred donation splash if one is pending. Shared by the OK
+/// button and the auto-dismiss timer.
+fn dismiss_complete_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    ctrl.borrow().complete_timer.stop();
+    w.set_show_complete(false);
+    if ctrl.borrow().splash_pending {
+        ctrl.borrow_mut().splash_pending = false;
+        w.set_show_splash(true);
+    }
+}
+
 fn apply_system_colors(w: &MainWindow) {
     if let Some(c) = crate::sys_colors::system_colors() {
         let theme = w.global::<Theme>();
