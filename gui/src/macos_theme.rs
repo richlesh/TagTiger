@@ -47,3 +47,17 @@ pub fn system_colors() -> Option<SystemColors> {
         })
     }
 }
+
+/// The macOS system font size in points (`NSFont.systemFontSize`), used for the
+/// "System" Font Size setting. Returns `None` if it can't be read.
+pub fn system_font_size() -> Option<f32> {
+    use objc2_app_kit::NSFont;
+    unsafe {
+        let size = NSFont::systemFontSize();
+        if size.is_finite() && size > 0.0 {
+            Some(size as f32)
+        } else {
+            None
+        }
+    }
+}

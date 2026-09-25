@@ -79,3 +79,70 @@ pub fn system_colors() -> Option<SystemColors> {
         accent,
     })
 }
+
+/// Read the desktop UI font size (in points) from the XDG settings portal's
+/// `org.gnome.desktop.interface` / `font-name` (e.g. "Cantarell 11"), which is
+/// what GNOME/GTK desktops expose. Returns `None` when unavailable or
+/// unpardseable, so the caller can fall back to a default.
+pub fn system_font_size() -> Option<f32> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let proxy = zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+    )
+    .ok()?;
+
+    let args = ("org.gnome.desktop.interface", "font-name");
+    let value: OwnedValue = proxy
+        .call("ReadOne", &args)
+        .or_else(|_| proxy.call("Read", &args))
+        .ok()?;
+
+    let font_name = string_from_value(value)?;
+    parse_font_points(&font_name)
+}
+
+/// Extract a `String` from a portal reply, peeling nested variant wrappers.
+fn string_from_value(value: OwnedValue) -> Option<String> {
+    if let Ok(s) = String::try_from(value.clone()) {
+        return Some(s);
+    }
+    let inner: Value = value.into();
+    if let Value::Value(boxed) = inner {
+        if let Ok(owned) = OwnedValue::try_from(*boxed) {
+            if let Ok(s) = String::try_from(owned) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the trailing point size from a Pango font description like
+/// "Cantarell 11" or "Sans Bold 10.5". Returns `None` if there's no size.
+fn parse_font_points(font_name: &str) -> Option<f32> {
+    let last = font_name.split_whitespace().last()?;
+    let pts: f32 = last.parse().ok()?;
+    if pts > 0.0 {
+        Some(pts)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_font_points;
+
+    #[test]
+    fn parses_pango_font_point_sizes() {
+        assert_eq!(parse_font_points("Cantarell 11"), Some(11.0));
+        assert_eq!(parse_font_points("Sans Bold 10.5"), Some(10.5));
+        assert_eq!(parse_font_points("Ubuntu Regular 12"), Some(12.0));
+        // No trailing size -> None.
+        assert_eq!(parse_font_points("Cantarell"), None);
+        assert_eq!(parse_font_points(""), None);
+    }
+}

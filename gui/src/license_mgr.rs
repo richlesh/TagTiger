@@ -90,12 +90,26 @@ pub struct Settings {
     /// existing settings files without this field keep the original look.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI font size: "System", "Small", "Medium", or "Large". Defaults to
+    /// "System" so existing settings files use the OS-defined size.
+    #[serde(default = "default_font_size")]
+    pub font_size: String,
 }
 
 /// Default theme when none is stored: Dark (the app's original appearance).
 fn default_theme() -> String {
     "Dark".to_string()
 }
+
+/// Default font size when none is stored: follow the OS.
+fn default_font_size() -> String {
+    "System".to_string()
+}
+
+/// Fixed font-size tiers (in logical pixels / points at standard DPI).
+pub const SMALL_FONT_PX: f32 = 12.0;
+pub const MEDIUM_FONT_PX: f32 = 15.0;
+pub const LARGE_FONT_PX: f32 = 18.0;
 
 impl Settings {
     /// Path to `~/.tagtiger-settings.json` (falls back to the current dir if
@@ -129,6 +143,40 @@ impl Settings {
     /// Dark, so a missing/empty field (older settings, `Default`) is Dark.
     pub fn theme_is_dark(&self) -> bool {
         !self.theme.eq_ignore_ascii_case("Light")
+    }
+
+    /// Resolve the configured font size to pixels. "System" uses the provided
+    /// OS size; the fixed tiers are Small = 12, Medium = 15, Large = 18.
+    pub fn font_size_px(&self, system_px: f32) -> f32 {
+        match self.font_size.to_ascii_lowercase().as_str() {
+            "small" => SMALL_FONT_PX,
+            "medium" => MEDIUM_FONT_PX,
+            "large" => LARGE_FONT_PX,
+            // "system" and anything unrecognized fall back to the OS size.
+            _ => system_px,
+        }
+    }
+
+    /// The Font Size combo index: 0 = System, 1 = Small, 2 = Medium, 3 = Large.
+    /// Unrecognized values map to System.
+    pub fn font_size_index(&self) -> i32 {
+        match self.font_size.to_ascii_lowercase().as_str() {
+            "small" => 1,
+            "medium" => 2,
+            "large" => 3,
+            _ => 0,
+        }
+    }
+
+    /// Map a Font Size combo index back to its stored string.
+    pub fn font_size_from_index(index: i32) -> String {
+        match index {
+            1 => "Small",
+            2 => "Medium",
+            3 => "Large",
+            _ => "System",
+        }
+        .to_string()
     }
 }
 
@@ -191,5 +239,37 @@ mod tests {
 
         // Default::default() has an empty theme, which counts as Dark.
         assert!(Settings::default().theme_is_dark());
+    }
+
+    #[test]
+    fn font_size_defaults_to_system_and_maps_to_pixels() {
+        // A settings file predating the font_size field defaults to "System".
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.font_size, "System");
+        assert_eq!(s.font_size_index(), 0);
+        // System uses the provided OS size verbatim.
+        assert_eq!(s.font_size_px(17.0), 17.0);
+
+        let small: Settings = serde_json::from_str(r#"{"font_size":"Small"}"#).unwrap();
+        assert_eq!(small.font_size_index(), 1);
+        assert_eq!(small.font_size_px(17.0), SMALL_FONT_PX);
+        assert_eq!(small.font_size_px(17.0), 12.0);
+
+        let medium: Settings = serde_json::from_str(r#"{"font_size":"Medium"}"#).unwrap();
+        assert_eq!(medium.font_size_index(), 2);
+        assert_eq!(medium.font_size_px(17.0), MEDIUM_FONT_PX);
+        assert_eq!(medium.font_size_px(17.0), 15.0);
+
+        let large: Settings = serde_json::from_str(r#"{"font_size":"Large"}"#).unwrap();
+        assert_eq!(large.font_size_index(), 3);
+        assert_eq!(large.font_size_px(17.0), LARGE_FONT_PX);
+        assert_eq!(large.font_size_px(17.0), 18.0);
+
+        // Index round-trips through the string mapping.
+        for i in 0..=3 {
+            let name = Settings::font_size_from_index(i);
+            let s = Settings { font_size: name, ..Default::default() };
+            assert_eq!(s.font_size_index(), i);
+        }
     }
 }

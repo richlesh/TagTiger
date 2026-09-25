@@ -17,6 +17,7 @@ tagtiger-core.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,7 +38,7 @@ serde_json.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5.2"
 objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSArray", "NSURL", "NSData", "NSGeometry"] }
-objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSResponder", "NSDragging", "NSMenu", "NSMenuItem", "NSApplication", "NSColor", "NSColorSpace"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSResponder", "NSDragging", "NSMenu", "NSMenuItem", "NSApplication", "NSColor", "NSColorSpace", "NSFont"] }
 # Obtain the NSView from the Slint window for native file drag-and-drop.
 raw-window-handle = "0.6"
 
@@ -45,7 +46,7 @@ raw-window-handle = "0.6"
 # the app's highlights and progress bar match the OS. Version matches Slint's
 # winit backend to avoid a duplicate `windows` crate in the graph.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 # Linux: read the XDG desktop-portal accent color over D-Bus. Version matches
 # Slint's winit backend.

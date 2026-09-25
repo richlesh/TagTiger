@@ -168,6 +168,17 @@ fn inspect(file: PathBuf) -> Result<()> {
             None => "(none)".into(),
         }
     );
+    // TV Show fields, when the file carries episode metadata.
+    if let MediaKindMeta::Episode(ep) = &meta.kind {
+        println!("Show:         {}", if ep.show_name.is_empty() { "(none)".into() } else { ep.show_name.clone() });
+        println!(
+            "Episode ID:   {}",
+            ep.episode_id.clone().unwrap_or_else(|| format!("{}x{:02}", ep.season, ep.episode))
+        );
+        println!("Season:       {}", ep.season);
+        println!("Episode:      {}", ep.episode);
+        println!("TV Network:   {}", opt(&ep.network));
+    }
     Ok(())
 }
 
@@ -178,18 +189,33 @@ async fn tag_file(file: PathBuf, id: String, tv: bool, no_artwork: bool) -> Resu
     } else {
         MediaKind::Movie
     };
+    // For TV, derive season/episode from the filename so the provider can
+    // fetch the specific episode's details.
+    let (fn_season, fn_episode) = if tv {
+        match naming::parse(&file) {
+            Ok(q) => (q.season, q.episode),
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     let pid = ProviderId {
         provider: "tmdb".into(),
         id,
         kind,
+        season: fn_season,
+        episode: fn_episode,
     };
     let mut meta = provider.fetch_details(&pid).await?;
 
-    // For episodes, enrich with season/episode parsed from the filename.
+    // For episodes, ensure season/episode are set even if the provider left
+    // them at 0 (e.g. sparse episode data): fall back to the filename values.
     if let MediaKindMeta::Episode(ref mut ep) = meta.kind {
-        if let Ok(q) = naming::parse(&file) {
-            ep.season = q.season.unwrap_or(ep.season);
-            ep.episode = q.episode.unwrap_or(ep.episode);
+        if ep.season == 0 {
+            ep.season = fn_season.unwrap_or(0);
+        }
+        if ep.episode == 0 {
+            ep.episode = fn_episode.unwrap_or(0);
         }
     }
 

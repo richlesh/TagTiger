@@ -12,7 +12,7 @@
 
 use crate::artwork::{ArtworkFormat, EncodedArtwork};
 use crate::error::Result;
-use crate::model::{MediaKindMeta, MediaMetadata, Person};
+use crate::model::{EpisodeInfo, MediaKindMeta, MediaMetadata, Person};
 use mp4ameta::{Data, DataIdent, Img, ImgFmt, MediaType, Tag};
 use std::path::Path;
 
@@ -107,7 +107,12 @@ pub fn build_tag(meta: &MediaMetadata, artwork: Option<&EncodedArtwork>) -> Tag 
         }
         set_fourcc_be_signed(&mut tag, ATOM_TV_SEASON, ep.season as i32);
         set_fourcc_be_signed(&mut tag, ATOM_TV_EPISODE, ep.episode as i32);
-        let episode_id = format!("{}x{:02}", ep.season, ep.episode);
+        // Prefer a user-supplied Episode ID; otherwise derive one from the
+        // season/episode (e.g. `1x02`).
+        let episode_id = match &ep.episode_id {
+            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => format!("{}x{:02}", ep.season, ep.episode),
+        };
         set_fourcc_utf8(&mut tag, ATOM_TV_EPISODE_ID, &episode_id);
     }
 
@@ -201,6 +206,24 @@ pub fn read_from_file(path: impl AsRef<Path>) -> Result<(MediaMetadata, Option<V
         if meta.studio.is_none() {
             meta.studio = people.studio;
         }
+    }
+
+    // TV-episode atoms -> MediaKindMeta::Episode. Present the show/season/etc.
+    // back to the editor when the file carries TV atoms (either because it is a
+    // TV Show `stik`, or simply has a `tvsh` show-name atom).
+    let tv_show = fourcc_utf8(&tag, ATOM_TV_SHOW);
+    let is_tv = meta.video_kind == Some(crate::model::VideoKind::TvShow) || tv_show.is_some();
+    if is_tv {
+        let season = fourcc_be_i32(&tag, ATOM_TV_SEASON).unwrap_or(0).max(0) as u32;
+        let episode = fourcc_be_i32(&tag, ATOM_TV_EPISODE).unwrap_or(0).max(0) as u32;
+        meta.kind = MediaKindMeta::Episode(EpisodeInfo {
+            show_name: tv_show.unwrap_or_default(),
+            season,
+            episode,
+            episode_title: None,
+            network: fourcc_utf8(&tag, ATOM_TV_NETWORK),
+            episode_id: fourcc_utf8(&tag, ATOM_TV_EPISODE_ID),
+        });
     }
 
     let cover = tag.artwork().map(|img| img.data.to_vec());
@@ -450,6 +473,29 @@ fn set_fourcc_be_signed(tag: &mut Tag, code: [u8; 4], value: i32) {
     );
 }
 
+/// Read a UTF-8 fourcc data atom, if present and non-empty.
+fn fourcc_utf8(tag: &Tag, code: [u8; 4]) -> Option<String> {
+    match tag.data_of(&DataIdent::fourcc(code)).next() {
+        Some(Data::Utf8(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Read a big-endian signed integer fourcc data atom, if present. Interprets
+/// the last 1–4 bytes as a big-endian signed value (matching how `tvsn`/`tves`
+/// are written).
+fn fourcc_be_i32(tag: &Tag, code: [u8; 4]) -> Option<i32> {
+    match tag.data_of(&DataIdent::fourcc(code)).next() {
+        Some(Data::BeSigned(bytes)) if !bytes.is_empty() => {
+            let mut buf = [0u8; 4];
+            let n = bytes.len().min(4);
+            buf[4 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
+            Some(i32::from_be_bytes(buf))
+        }
+        _ => None,
+    }
+}
+
 /// Serialize cast/directors/producers/screenwriters into the Apple `iTunMOVI`
 /// plist XML. Returns `None` if there is nothing to write.
 fn build_itunmovi_plist(meta: &MediaMetadata) -> Option<String> {
@@ -674,8 +720,53 @@ mod tests {
             episode: 2,
             episode_title: Some("Cat's in the Bag".into()),
             network: Some("AMC".into()),
+            episode_id: None,
         });
         let tag = build_tag(&meta, None);
         assert_eq!(tag.media_type(), Some(MediaType::TvShow));
+    }
+
+    #[test]
+    fn tv_atoms_written_and_readable_from_tag() {
+        let mut meta = sample_movie();
+        meta.video_kind = Some(crate::model::VideoKind::TvShow);
+        meta.kind = MediaKindMeta::Episode(EpisodeInfo {
+            show_name: "Breaking Bad".into(),
+            season: 1,
+            episode: 2,
+            episode_title: None,
+            network: Some("AMC".into()),
+            episode_id: None,
+        });
+        let tag = build_tag(&meta, None);
+        // Show / network round-trip via the read helpers.
+        assert_eq!(
+            fourcc_utf8(&tag, ATOM_TV_SHOW).as_deref(),
+            Some("Breaking Bad")
+        );
+        assert_eq!(fourcc_utf8(&tag, ATOM_TV_NETWORK).as_deref(), Some("AMC"));
+        assert_eq!(fourcc_be_i32(&tag, ATOM_TV_SEASON), Some(1));
+        assert_eq!(fourcc_be_i32(&tag, ATOM_TV_EPISODE), Some(2));
+        // With no override, the Episode ID is derived from season/episode.
+        assert_eq!(fourcc_utf8(&tag, ATOM_TV_EPISODE_ID).as_deref(), Some("1x02"));
+    }
+
+    #[test]
+    fn user_episode_id_override_is_written() {
+        let mut meta = sample_movie();
+        meta.video_kind = Some(crate::model::VideoKind::TvShow);
+        meta.kind = MediaKindMeta::Episode(EpisodeInfo {
+            show_name: "Breaking Bad".into(),
+            season: 1,
+            episode: 2,
+            episode_title: None,
+            network: None,
+            episode_id: Some("Pilot".into()),
+        });
+        let tag = build_tag(&meta, None);
+        assert_eq!(
+            fourcc_utf8(&tag, ATOM_TV_EPISODE_ID).as_deref(),
+            Some("Pilot")
+        );
     }
 }

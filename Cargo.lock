@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "tagtiger-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "tagtiger-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4961,13 +4961,14 @@ dependencies = [
 
 [[package]]
 name = "tagtiger-gui"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arboard",
  "chrono",
  "dirs",
  "embed-resource",
+ "futures",
  "hmac",
  "image",
  "objc2 0.5.2",
@@ -4992,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "tagtiger-launch"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",

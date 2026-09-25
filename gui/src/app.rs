@@ -43,6 +43,12 @@ struct Snapshot {
     producers: String,
     writers: String,
     studio: String,
+    // TV Show fields (only meaningful when video_kind == TvShow).
+    tv_show: String,
+    tv_episode_id: String,
+    tv_season: String,
+    tv_episode: String,
+    tv_network: String,
     cover_bytes: Option<Vec<u8>>,
     cover_size: Option<(u32, u32)>,
 }
@@ -64,6 +70,11 @@ fn empty_snapshot() -> Snapshot {
         producers: String::new(),
         writers: String::new(),
         studio: String::new(),
+        tv_show: String::new(),
+        tv_episode_id: String::new(),
+        tv_season: String::new(),
+        tv_episode: String::new(),
+        tv_network: String::new(),
         cover_bytes: None,
         cover_size: None,
     }
@@ -75,6 +86,53 @@ fn empty_snapshot() -> Snapshot {
 enum Lightbox {
     Tmdb(usize),
     CurrentCover,
+}
+
+/// One season node in the TV Matches tree, with lazy-loaded episodes.
+struct TreeSeasonNode {
+    season_number: u32,
+    name: String,
+    episode_count: u32,
+    expanded: bool,
+    /// Whether the episode list has been fetched yet.
+    loaded: bool,
+    /// Whether a fetch is in flight (shows a spinner glyph).
+    loading: bool,
+    /// (episode_number, episode_name) pairs once loaded.
+    episodes: Vec<(u32, String)>,
+}
+
+/// One show root in the TV Matches tree, with lazily-loaded seasons.
+struct TreeShowNode {
+    series_id: String,
+    show_name: String,
+    /// First-air year, appended to the label when known.
+    year: Option<i32>,
+    expanded: bool,
+    /// Whether the season summaries have been fetched yet.
+    seasons_loaded: bool,
+    /// Whether a seasons fetch is in flight (spinner glyph on the show row).
+    seasons_loading: bool,
+    seasons: Vec<TreeSeasonNode>,
+}
+
+/// The TV Matches tree state: a list of matching show roots, each with lazily
+/// loaded season children and episode leaves. Empty means no tree — the flat
+/// matches list is shown instead.
+#[derive(Default)]
+struct TvTree {
+    shows: Vec<TreeShowNode>,
+    /// Optional season filter (from the Season search button): each show's
+    /// seasons are restricted to this one season when set.
+    season_filter: Option<u32>,
+    /// The currently selected episode as (series_id, season, episode).
+    selected: Option<(String, u32, u32)>,
+}
+
+impl TvTree {
+    fn is_empty(&self) -> bool {
+        self.shows.is_empty()
+    }
 }
 
 /// Controller state shared between the UI callbacks and the event-drain timer.
@@ -139,6 +197,17 @@ struct Controller {
     /// Theme (dark?) when the Settings dialog was opened, so Cancel can revert a
     /// live theme preview.
     theme_before_settings: bool,
+    /// The TV Matches tree (Show → Season → Episode). Empty for movie searches
+    /// and TV single-episode lookups (which use the flat matches list).
+    tv_tree: TvTree,
+    /// Cache of show-level poster artwork keyed by series_id, so posters are
+    /// fetched once per show and stay stable across season/episode selection.
+    show_poster_cache: std::collections::HashMap<String, Vec<tagtiger_core::model::Artwork>>,
+    /// The series_id whose show posters currently populate the poster grid.
+    active_poster_show: Option<String>,
+    /// Font Size index (0=System) when the Settings dialog was opened, so
+    /// Cancel can revert a live preview.
+    font_index_before_settings: i32,
 }
 
 /// Build the window, wire up the worker + callbacks, and run the event loop.
@@ -200,6 +269,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
         full_requested: Vec::new(),
         splash_pending: false,
         theme_before_settings: true,
+        tv_tree: TvTree::default(),
+        font_index_before_settings: 0,
+        show_poster_cache: std::collections::HashMap::new(),
+        active_poster_show: None,
     }));
 
     // App version + icon for the dialogs.
@@ -216,6 +289,13 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let dark = ctrl.borrow().settings.theme_is_dark();
     window.set_theme_dark(dark);
     window.set_settings_theme_index(if dark { 1 } else { 0 });
+
+    // Font size: apply the persisted setting (System/Small/Medium/Large).
+    {
+        let idx = ctrl.borrow().settings.font_size_index();
+        window.set_settings_font_index(idx);
+        apply_font_index(&window, idx);
+    }
 
     // Match the app's highlight/accent colors to the user's OS setting (macOS:
     // the chosen accent + selection colors). Falls back to Slint's Palette
@@ -388,6 +468,10 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
                 let prev = ctrl.borrow().theme_before_settings;
                 w.set_theme_dark(prev);
                 w.set_settings_theme_index(if prev { 1 } else { 0 });
+                // Revert any live font-size preview too.
+                let font_prev = ctrl.borrow().font_index_before_settings;
+                w.set_settings_font_index(font_prev);
+                apply_font_index(&w, font_prev);
                 w.set_show_settings(false);
             }
         }
@@ -407,6 +491,15 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
             if let Some(w) = handle.upgrade() {
                 // 0 = Light, 1 = Dark. Apply immediately for a live preview.
                 w.set_theme_dark(idx != 0);
+            }
+        }
+    });
+    window.on_font_size_changed({
+        let handle = window.as_weak();
+        move |idx| {
+            if let Some(w) = handle.upgrade() {
+                // Apply immediately for a live preview (persisted on Save).
+                apply_font_index(&w, idx);
             }
         }
     });
@@ -504,9 +597,54 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
     {
         let ctrl = ctrl.clone();
         let handle = window.as_weak();
-        window.on_do_search(move || {
+        window.on_title_search(move || {
             if let Some(w) = handle.upgrade() {
-                start_search(&ctrl, &w);
+                start_title_search(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_search_tv(move || {
+            if let Some(w) = handle.upgrade() {
+                start_tv_search_show(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_search_tv_season(move || {
+            if let Some(w) = handle.upgrade() {
+                start_tv_search_season(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_search_tv_episode(move || {
+            if let Some(w) = handle.upgrade() {
+                start_tv_search_episode(&ctrl, &w);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_tree_toggle(move |idx| {
+            if let Some(w) = handle.upgrade() {
+                tree_toggle(&ctrl, &w, idx);
+            }
+        });
+    }
+    {
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        window.on_tree_select(move |idx| {
+            if let Some(w) = handle.upgrade() {
+                tree_select(&ctrl, &w, idx);
             }
         });
     }
@@ -707,7 +845,7 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
             Event::FileLoaded {
                 file,
                 meta,
-                suggested_query,
+                suggested_query: _,
                 cover,
                 cover_size,
                 cover_bytes,
@@ -733,7 +871,8 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 w.set_poster_selected(false);
                 w.set_selected_poster_index(-1);
                 w.set_selected_match_index(-1);
-                w.set_search_query(SharedString::from(suggested_query));
+                // A freshly opened file resets any prior TV Matches tree.
+                clear_tv_tree(ctrl, w);
                 w.set_fast_start(fast_start);
                 set_matches(ctrl, w);
                 // Current cover display + size caption.
@@ -790,6 +929,240 @@ fn drain_events(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
                 w.set_status(SharedString::from(format!("{n} match(es).")));
                 w.set_selected_match_index(-1);
                 set_matches(ctrl, w);
+            }
+            Event::TvShowsReady {
+                shows,
+                season_filter,
+            } => {
+                if shows.is_empty() {
+                    ctrl.borrow_mut().tv_tree = TvTree::default();
+                    w.set_tv_tree_rows(ModelRc::new(VecModel::from(Vec::<TreeRow>::new())));
+                    w.set_status(SharedString::from("No matching show found."));
+                } else {
+                    let single_show = shows.len() == 1;
+                    let first_series_id = shows.first().map(|s| s.series_id.clone());
+                    let nodes: Vec<TreeShowNode> = shows
+                        .into_iter()
+                        .map(|s| TreeShowNode {
+                            series_id: s.series_id,
+                            show_name: s.name,
+                            year: s.year,
+                            expanded: false,
+                            seasons_loaded: false,
+                            seasons_loading: false,
+                            seasons: Vec::new(),
+                        })
+                        .collect();
+                    {
+                        let mut c = ctrl.borrow_mut();
+                        c.tv_tree = TvTree {
+                            shows: nodes,
+                            season_filter,
+                            selected: None,
+                        };
+                    }
+                    let n = ctrl.borrow().tv_tree.shows.len();
+                    w.set_status(SharedString::from(format!(
+                        "{n} matching show(s). Expand a show to browse seasons."
+                    )));
+                    rebuild_tree_rows(ctrl, w);
+                    // With a single matching show, auto-expand it (fetches its
+                    // seasons + posters) for convenience.
+                    if single_show {
+                        if let Some(sid) = first_series_id {
+                            let (fetch_seasons, fetch_posters) = {
+                                let mut c = ctrl.borrow_mut();
+                                if let Some(show) = c.tv_tree.shows.first_mut() {
+                                    show.expanded = true;
+                                    show.seasons_loading = true;
+                                }
+                                let fetch_posters = !c.show_poster_cache.contains_key(&sid);
+                                (true, fetch_posters)
+                            };
+                            activate_show_posters(ctrl, w, &sid);
+                            {
+                                let c = ctrl.borrow();
+                                if fetch_seasons {
+                                    let _ = c.worker.tx.send(Request::FetchShowSeasons {
+                                        series_id: sid.clone(),
+                                        season_filter,
+                                    });
+                                }
+                                if fetch_posters {
+                                    let _ = c
+                                        .worker
+                                        .tx
+                                        .send(Request::FetchShowPosters { series_id: sid });
+                                }
+                            }
+                            rebuild_tree_rows(ctrl, w);
+                        }
+                    }
+                }
+            }
+            Event::TvTreeFilteredReady { shows } => {
+                if shows.is_empty() {
+                    ctrl.borrow_mut().tv_tree = TvTree::default();
+                    w.set_tv_tree_rows(ModelRc::new(VecModel::from(Vec::<TreeRow>::new())));
+                    w.set_status(SharedString::from("No matching episodes found."));
+                } else {
+                    // Build a fully-populated, expanded tree from the matches:
+                    // shows expanded, matching seasons expanded, episodes shown.
+                    let series_ids: Vec<String> =
+                        shows.iter().map(|s| s.series_id.clone()).collect();
+                    let first_series_id = series_ids.first().cloned();
+                    let nodes: Vec<TreeShowNode> = shows
+                        .into_iter()
+                        .map(|show| {
+                            let seasons = show
+                                .seasons
+                                .into_iter()
+                                .map(|s| TreeSeasonNode {
+                                    season_number: s.season_number,
+                                    name: s.name,
+                                    episode_count: s.episodes.len() as u32,
+                                    expanded: true,
+                                    loaded: true,
+                                    loading: false,
+                                    episodes: s
+                                        .episodes
+                                        .into_iter()
+                                        .map(|e| (e.number, e.name))
+                                        .collect(),
+                                })
+                                .collect();
+                            TreeShowNode {
+                                series_id: show.series_id,
+                                show_name: show.show_name,
+                                year: show.year,
+                                expanded: true,
+                                seasons_loaded: true,
+                                seasons_loading: false,
+                                seasons,
+                            }
+                        })
+                        .collect();
+                    {
+                        let mut c = ctrl.borrow_mut();
+                        c.tv_tree = TvTree {
+                            shows: nodes,
+                            season_filter: None,
+                            selected: None,
+                        };
+                    }
+                    let n = ctrl.borrow().tv_tree.shows.len();
+                    w.set_status(SharedString::from(format!(
+                        "{n} matching show(s). Pick an episode."
+                    )));
+                    rebuild_tree_rows(ctrl, w);
+                    // Show posters for the first matching show, and fetch any
+                    // uncached show posters so the grid is ready as you browse.
+                    if let Some(sid) = first_series_id {
+                        activate_show_posters(ctrl, w, &sid);
+                    }
+                    let to_fetch: Vec<String> = {
+                        let c = ctrl.borrow();
+                        series_ids
+                            .into_iter()
+                            .filter(|sid| !c.show_poster_cache.contains_key(sid))
+                            .collect()
+                    };
+                    let c = ctrl.borrow();
+                    for sid in to_fetch {
+                        let _ = c.worker.tx.send(Request::FetchShowPosters { series_id: sid });
+                    }
+                }
+            }
+            Event::ShowSeasonsReady {
+                series_id,
+                seasons,
+                season_filter: _,
+            } => {
+                let single_season = seasons.len() == 1;
+                let first_season = seasons.first().map(|s| s.season_number);
+                {
+                    let mut c = ctrl.borrow_mut();
+                    if let Some(show) =
+                        c.tv_tree.shows.iter_mut().find(|s| s.series_id == series_id)
+                    {
+                        show.seasons = seasons
+                            .into_iter()
+                            .map(|s| TreeSeasonNode {
+                                season_number: s.season_number,
+                                name: s.name,
+                                episode_count: s.episode_count,
+                                expanded: false,
+                                loaded: false,
+                                loading: false,
+                                episodes: Vec::new(),
+                            })
+                            .collect();
+                        show.seasons_loaded = true;
+                        show.seasons_loading = false;
+                    }
+                }
+                // When a show has exactly one season, auto-expand it.
+                if single_season {
+                    if let Some(season) = first_season {
+                        let need_fetch = {
+                            let mut c = ctrl.borrow_mut();
+                            let mut need_fetch = false;
+                            if let Some(show) =
+                                c.tv_tree.shows.iter_mut().find(|s| s.series_id == series_id)
+                            {
+                                if let Some(node) =
+                                    show.seasons.iter_mut().find(|n| n.season_number == season)
+                                {
+                                    node.expanded = true;
+                                    node.loading = true;
+                                    need_fetch = true;
+                                }
+                            }
+                            need_fetch
+                        };
+                        if need_fetch {
+                            let c = ctrl.borrow();
+                            let _ = c.worker.tx.send(Request::FetchSeasonEpisodes {
+                                series_id: series_id.clone(),
+                                season,
+                            });
+                        }
+                    }
+                }
+                rebuild_tree_rows(ctrl, w);
+            }
+            Event::ShowPostersReady { series_id, artwork } => {
+                {
+                    let mut c = ctrl.borrow_mut();
+                    c.show_poster_cache.insert(series_id.clone(), artwork.clone());
+                }
+                // If this show's posters are the active grid, populate them now.
+                let is_active = ctrl.borrow().active_poster_show.as_deref() == Some(series_id.as_str());
+                if is_active && !artwork.is_empty() {
+                    set_poster_grid(ctrl, w, &artwork);
+                }
+            }
+            Event::SeasonEpisodesReady {
+                series_id,
+                season,
+                episodes,
+            } => {
+                {
+                    let mut c = ctrl.borrow_mut();
+                    if let Some(show) =
+                        c.tv_tree.shows.iter_mut().find(|s| s.series_id == series_id)
+                    {
+                        if let Some(node) =
+                            show.seasons.iter_mut().find(|n| n.season_number == season)
+                        {
+                            node.episodes = episodes;
+                            node.loaded = true;
+                            node.loading = false;
+                            node.expanded = true;
+                        }
+                    }
+                }
+                rebuild_tree_rows(ctrl, w);
             }
             Event::DetailsDone { meta } => {
                 ctrl.borrow_mut().loading_details = false;
@@ -925,6 +1298,7 @@ fn set_matches(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
         .map(|r| MatchItem {
             title: SharedString::from(r.title.clone()),
             year: SharedString::from(r.year.map(|y| y.to_string()).unwrap_or_default()),
+            episode: SharedString::from(r.episode_name.clone().unwrap_or_default()),
         })
         .collect();
     w.set_matches(ModelRc::new(VecModel::from(items)));
@@ -946,11 +1320,25 @@ fn select_match(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
         let Some(file) = c.file.clone() else {
             return;
         };
+        // For a TV match, decide which season/episode to fetch details for.
+        // A result produced by the episode-list / episode search already carries
+        // its own season/episode in `r.id` — prefer those. Otherwise fall back
+        // to the editor's Season/Episode fields (blank/zero means "unknown",
+        // and the worker then falls back to the filename-parsed values).
+        let (season, episode) = if r.id.kind == tagtiger_core::model::MediaKind::TvShow {
+            let field_s = w.get_tv_season_text().trim().parse::<u32>().ok().filter(|n| *n > 0);
+            let field_e = w.get_tv_episode_text().trim().parse::<u32>().ok().filter(|n| *n > 0);
+            (r.id.season.or(field_s), r.id.episode.or(field_e))
+        } else {
+            (None, None)
+        };
         (
             ProviderId {
                 provider: r.id.provider.clone(),
                 id: r.id.id.clone(),
                 kind: r.id.kind,
+                season,
+                episode,
             },
             file,
         )
@@ -961,6 +1349,304 @@ fn select_match(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, idx: i32) {
     w.set_status(SharedString::from("Loading details…"));
     let c = ctrl.borrow();
     let _ = c.worker.tx.send(Request::FetchDetails { id, file });
+}
+
+// ---------------------------------------------------------------------------
+// TV Matches tree (Show → Season → Episode)
+// ---------------------------------------------------------------------------
+
+/// Flatten the controller's `tv_tree` into the visible `TreeRow` list and push
+/// it to the window. Only expanded nodes contribute their children.
+fn rebuild_tree_rows(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let rows: Vec<TreeRow> = {
+        let c = ctrl.borrow();
+        let t = &c.tv_tree;
+        if t.is_empty() {
+            Vec::new()
+        } else {
+            let mut rows = Vec::new();
+            for show in &t.shows {
+                let show_label = match show.year {
+                    Some(y) => format!("{} ({y})", show.show_name),
+                    None => show.show_name.clone(),
+                };
+                rows.push(TreeRow {
+                    kind: 0,
+                    label: SharedString::from(show_label),
+                    indent: 0,
+                    expandable: true,
+                    expanded: show.expanded,
+                    loading: show.seasons_loading,
+                    selectable: false,
+                    selected: false,
+                });
+                if show.expanded {
+                    for s in &show.seasons {
+                        rows.push(TreeRow {
+                            kind: 1,
+                            label: SharedString::from(if s.episode_count > 0 {
+                                format!("{} ({} episodes)", s.name, s.episode_count)
+                            } else {
+                                s.name.clone()
+                            }),
+                            indent: 1,
+                            expandable: true,
+                            expanded: s.expanded,
+                            loading: s.loading,
+                            selectable: false,
+                            selected: false,
+                        });
+                        if s.expanded {
+                            for (num, name) in &s.episodes {
+                                let selected = t.selected.as_ref().map_or(false, |(sid, se, ep)| {
+                                    *sid == show.series_id && *se == s.season_number && *ep == *num
+                                });
+                                rows.push(TreeRow {
+                                    kind: 2,
+                                    label: SharedString::from(format!("{num}: {name}")),
+                                    indent: 2,
+                                    expandable: false,
+                                    expanded: false,
+                                    loading: false,
+                                    selectable: true,
+                                    selected,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            rows
+        }
+    };
+    w.set_tv_tree_rows(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Map a visible row index back to what it represents in the tree. Carries the
+/// owning show's index (and, for episodes, the series_id). Mirrors the
+/// flattening order in `rebuild_tree_rows`.
+enum TreeHit {
+    Show(usize),
+    Season(usize, u32),
+    Episode(String, u32, u32),
+}
+
+fn locate_tree_row(t: &TvTree, index: usize) -> Option<TreeHit> {
+    if t.is_empty() {
+        return None;
+    }
+    let mut i = 0usize;
+    for (show_idx, show) in t.shows.iter().enumerate() {
+        if index == i {
+            return Some(TreeHit::Show(show_idx));
+        }
+        i += 1;
+        if !show.expanded {
+            continue;
+        }
+        for s in &show.seasons {
+            if index == i {
+                return Some(TreeHit::Season(show_idx, s.season_number));
+            }
+            i += 1;
+            if s.expanded {
+                for (num, _) in &s.episodes {
+                    if index == i {
+                        return Some(TreeHit::Episode(
+                            show.series_id.clone(),
+                            s.season_number,
+                            *num,
+                        ));
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A triangle was clicked: toggle the show root or a season. Expanding an
+/// unloaded season triggers a lazy episode fetch.
+fn tree_toggle(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, index: i32) {
+    if index < 0 {
+        return;
+    }
+    let index = index as usize;
+    let hit = {
+        let c = ctrl.borrow();
+        locate_tree_row(&c.tv_tree, index)
+    };
+    match hit {
+        Some(TreeHit::Show(show_idx)) => {
+            // Toggle the show root; on first expand, lazily fetch its seasons
+            // and (once) its show-level posters, and make it the active poster
+            // show so the grid reflects the show being browsed.
+            let (fetch_seasons, fetch_posters, series_id, season_filter) = {
+                let mut c = ctrl.borrow_mut();
+                let season_filter = c.tv_tree.season_filter;
+                let mut fetch_seasons = false;
+                let (series_id, mut fetch_posters) = if let Some(show) =
+                    c.tv_tree.shows.get_mut(show_idx)
+                {
+                    show.expanded = !show.expanded;
+                    if show.expanded && !show.seasons_loaded && !show.seasons_loading {
+                        show.seasons_loading = true;
+                        fetch_seasons = true;
+                    }
+                    (show.series_id.clone(), show.expanded)
+                } else {
+                    (String::new(), false)
+                };
+                // Only fetch posters we haven't cached yet.
+                if fetch_posters && c.show_poster_cache.contains_key(&series_id) {
+                    fetch_posters = false;
+                }
+                (fetch_seasons, fetch_posters, series_id, season_filter)
+            };
+            if !series_id.is_empty() {
+                // Show the (cached or soon-to-arrive) posters for this show.
+                activate_show_posters(ctrl, w, &series_id);
+            }
+            {
+                let c = ctrl.borrow();
+                if fetch_seasons {
+                    let _ = c.worker.tx.send(Request::FetchShowSeasons {
+                        series_id: series_id.clone(),
+                        season_filter,
+                    });
+                }
+                if fetch_posters {
+                    let _ = c
+                        .worker
+                        .tx
+                        .send(Request::FetchShowPosters { series_id: series_id.clone() });
+                }
+            }
+            rebuild_tree_rows(ctrl, w);
+        }
+        Some(TreeHit::Season(show_idx, season)) => {
+            let (need_fetch, series_id) = {
+                let mut c = ctrl.borrow_mut();
+                let mut need_fetch = false;
+                let series_id = c
+                    .tv_tree
+                    .shows
+                    .get(show_idx)
+                    .map(|s| s.series_id.clone())
+                    .unwrap_or_default();
+                if let Some(show) = c.tv_tree.shows.get_mut(show_idx) {
+                    if let Some(node) =
+                        show.seasons.iter_mut().find(|n| n.season_number == season)
+                    {
+                        node.expanded = !node.expanded;
+                        if node.expanded && !node.loaded && !node.loading {
+                            node.loading = true;
+                            need_fetch = true;
+                        }
+                    }
+                }
+                (need_fetch, series_id)
+            };
+            if need_fetch && !series_id.is_empty() {
+                let c = ctrl.borrow();
+                let _ = c.worker.tx.send(Request::FetchSeasonEpisodes { series_id, season });
+            }
+            rebuild_tree_rows(ctrl, w);
+        }
+        _ => {}
+    }
+}
+
+/// An episode leaf was clicked: fetch that episode's full details.
+fn tree_select(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, index: i32) {
+    if index < 0 {
+        return;
+    }
+    let index = index as usize;
+    let (hit, file, loading) = {
+        let c = ctrl.borrow();
+        (
+            locate_tree_row(&c.tv_tree, index),
+            c.file.clone(),
+            c.loading_details,
+        )
+    };
+    if loading {
+        return;
+    }
+    let (Some(TreeHit::Episode(series_id, season, episode)), Some(file)) = (hit, file) else {
+        return;
+    };
+    // Keep the show posters for this episode's show visible/stable.
+    activate_show_posters(ctrl, w, &series_id);
+    ctrl.borrow_mut().tv_tree.selected = Some((series_id.clone(), season, episode));
+    ctrl.borrow_mut().loading_details = true;
+    w.set_loading_details(true);
+    w.set_status(SharedString::from(format!("Loading S{season:02}E{episode:02} details…")));
+    rebuild_tree_rows(ctrl, w);
+    let id = ProviderId {
+        provider: "tmdb".into(),
+        id: series_id,
+        kind: tagtiger_core::model::MediaKind::TvShow,
+        season: Some(season),
+        episode: Some(episode),
+    };
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::FetchDetails { id, file });
+}
+
+/// Populate the poster grid from a show's cached posters (if we have them) and
+/// mark it the active poster show. When not cached yet, the grid is left as-is;
+/// `ShowPostersReady` will fill it once the fetch completes.
+fn activate_show_posters(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, series_id: &str) {
+    let cached = {
+        let mut c = ctrl.borrow_mut();
+        c.active_poster_show = Some(series_id.to_string());
+        c.show_poster_cache.get(series_id).cloned()
+    };
+    if let Some(artwork) = cached {
+        set_poster_grid(ctrl, w, &artwork);
+    }
+}
+
+/// Replace the poster grid model with placeholders for `artwork` and kick off
+/// lazy thumbnail loading, mirroring `load_meta`'s poster setup. Also updates
+/// the controller's `meta.artwork` so poster selection/lightbox use these URLs.
+fn set_poster_grid(
+    ctrl: &Rc<RefCell<Controller>>,
+    _w: &MainWindow,
+    artwork: &[tagtiger_core::model::Artwork],
+) {
+    let n = artwork.len();
+    {
+        let c = ctrl.borrow();
+        c.posters.set_vec(
+            artwork
+                .iter()
+                .map(|art| PosterItem {
+                    image: slint::Image::default(),
+                    loaded: false,
+                    size: SharedString::from(size_caption(art.width.zip(art.height))),
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    {
+        let mut c = ctrl.borrow_mut();
+        c.thumb_requested = vec![false; n];
+        c.full_images = vec![None; n];
+        c.full_requested = vec![false; n];
+        // Ensure the artwork URLs back the grid for thumb/lightbox fetches.
+        if let Some(meta) = c.meta.as_mut() {
+            meta.artwork = artwork.to_vec();
+        } else {
+            let mut m = tagtiger_core::model::MediaMetadata::default();
+            m.artwork = artwork.to_vec();
+            c.meta = Some(m);
+        }
+    }
+    request_visible_thumbs(ctrl, 0, 1, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1670,11 @@ fn snapshot(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) -> Snapshot {
         producers: w.get_producers_text().to_string(),
         writers: w.get_writers_text().to_string(),
         studio: w.get_studio_text().to_string(),
+        tv_show: w.get_tv_show_text().to_string(),
+        tv_episode_id: w.get_tv_episode_id_text().to_string(),
+        tv_season: w.get_tv_season_text().to_string(),
+        tv_episode: w.get_tv_episode_text().to_string(),
+        tv_network: w.get_tv_network_text().to_string(),
         cover_bytes: c.cover_bytes.clone(),
         cover_size: c.cover_size,
     }
@@ -1099,6 +1790,11 @@ fn apply_snapshot(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow, s: Snapshot) {
     w.set_producers_text(SharedString::from(s.producers));
     w.set_writers_text(SharedString::from(s.writers));
     w.set_studio_text(SharedString::from(s.studio));
+    w.set_tv_show_text(SharedString::from(s.tv_show));
+    w.set_tv_episode_id_text(SharedString::from(s.tv_episode_id));
+    w.set_tv_season_text(SharedString::from(s.tv_season));
+    w.set_tv_episode_text(SharedString::from(s.tv_episode));
+    w.set_tv_network_text(SharedString::from(s.tv_network));
     ctrl.borrow_mut().cover_size = s.cover_size;
     set_cover_bytes(ctrl, w, s.cover_bytes);
     w.set_cover_size_caption(SharedString::from(size_caption(s.cover_size)));
@@ -1137,6 +1833,20 @@ fn apply_system_colors(w: &MainWindow) {
         theme.set_sys_accent(col(c.accent));
         theme.set_has_sys_colors(true);
     }
+}
+
+/// Compute the pixel size for a Font Size combo index (0=System, 1=Small,
+/// 2=Medium, 3=Large) and apply it to the window's global base font size.
+fn apply_font_index(w: &MainWindow, index: i32) {
+    let system_px = crate::sys_colors::system_font_size();
+    let name = crate::license_mgr::Settings::font_size_from_index(index);
+    let px = crate::license_mgr::Settings {
+        font_size: name,
+        ..Default::default()
+    }
+    .font_size_px(system_px);
+    // Slint `length` properties are generated as `f32` (logical pixels).
+    w.set_base_font_size(px);
 }
 
 fn update_undo_redo(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
@@ -1348,6 +2058,46 @@ fn load_meta(
         w.set_studio_text(SharedString::from(meta.studio.clone().unwrap_or_default()));
     }
 
+    // TV Show fields: populated from the episode metadata when present. When
+    // the item isn't an episode, clear them (a fresh Movie load) unless a lock
+    // asks to keep the current value.
+    {
+        use tagtiger_core::model::MediaKindMeta;
+        let ep = match &meta.kind {
+            MediaKindMeta::Episode(ep) => Some(ep.clone()),
+            MediaKindMeta::Movie => None,
+        };
+        let show = ep.as_ref().map(|e| e.show_name.clone()).unwrap_or_default();
+        let episode_id = ep.as_ref().and_then(|e| e.episode_id.clone()).unwrap_or_default();
+        // Season/episode display as plain numbers; 0 is treated as "unset".
+        let season = ep
+            .as_ref()
+            .filter(|e| e.season > 0)
+            .map(|e| e.season.to_string())
+            .unwrap_or_default();
+        let episode = ep
+            .as_ref()
+            .filter(|e| e.episode > 0)
+            .map(|e| e.episode.to_string())
+            .unwrap_or_default();
+        let network = ep.as_ref().and_then(|e| e.network.clone()).unwrap_or_default();
+        if !(respect_locks && w.get_lock_tv_show()) {
+            w.set_tv_show_text(SharedString::from(show));
+        }
+        if !(respect_locks && w.get_lock_tv_episode_id()) {
+            w.set_tv_episode_id_text(SharedString::from(episode_id));
+        }
+        if !(respect_locks && w.get_lock_tv_season()) {
+            w.set_tv_season_text(SharedString::from(season));
+        }
+        if !(respect_locks && w.get_lock_tv_episode()) {
+            w.set_tv_episode_text(SharedString::from(episode));
+        }
+        if !(respect_locks && w.get_lock_tv_network()) {
+            w.set_tv_network_text(SharedString::from(network));
+        }
+    }
+
     // Rebuild the poster grid model (all placeholders; thumbs fetched below).
     let n = meta.artwork.len();
     {
@@ -1497,6 +2247,49 @@ fn collect_edited(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) -> Option<Medi
     } else {
         Some(studio.trim().to_string())
     };
+
+    // TV Show fields -> MediaKindMeta. When the user selected "TV Show" as the
+    // Video Kind, build an Episode kind from the TV fields; otherwise it stays
+    // a Movie. Preserve any episode_title already present in the base metadata.
+    {
+        use tagtiger_core::model::{EpisodeInfo, MediaKindMeta};
+        if index_to_video_kind(w.get_video_kind_index()) == Some(VideoKind::TvShow) {
+            let existing_title = match &m.kind {
+                MediaKindMeta::Episode(ep) => ep.episode_title.clone(),
+                MediaKindMeta::Movie => None,
+            };
+            let show_name = w.get_tv_show_text().trim().to_string();
+            let season = w
+                .get_tv_season_text()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0);
+            let episode = w
+                .get_tv_episode_text()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0);
+            let episode_id = {
+                let s = w.get_tv_episode_id_text().trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+            let network = {
+                let s = w.get_tv_network_text().trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+            m.kind = MediaKindMeta::Episode(EpisodeInfo {
+                show_name,
+                season,
+                episode,
+                episode_title: existing_title,
+                network,
+                episode_id,
+            });
+        } else {
+            m.kind = MediaKindMeta::Movie;
+        }
+    }
+
     Some(m)
 }
 
@@ -1563,6 +2356,11 @@ fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     w.set_settings_theme_index(if dark { 1 } else { 0 });
     w.set_theme_dark(dark);
     ctrl.borrow_mut().theme_before_settings = dark;
+    // Reflect + remember the current Font Size so Cancel can revert a preview.
+    let font_idx = ctrl.borrow().settings.font_size_index();
+    w.set_settings_font_index(font_idx);
+    apply_font_index(w, font_idx);
+    ctrl.borrow_mut().font_index_before_settings = font_idx;
     w.set_show_settings(true);
 }
 
@@ -1571,12 +2369,16 @@ fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 fn settings_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     let token = w.get_settings_token().trim().to_string();
     let dark = w.get_settings_theme_index() != 0;
+    let font_idx = w.get_settings_font_index();
     let result = {
         let mut c = ctrl.borrow_mut();
         c.settings.tmdb_bearer_token = token.clone();
         c.settings.theme = if dark { "Dark".into() } else { "Light".into() };
+        c.settings.font_size = crate::license_mgr::Settings::font_size_from_index(font_idx);
         c.settings.save()
     };
+    // Apply the chosen size (in case Save is clicked without a prior preview).
+    apply_font_index(w, font_idx);
     match result {
         Ok(()) => w.set_status(SharedString::from("TMDB token saved.")),
         Err(e) => w.set_status(SharedString::from(format!("Failed to save settings: {e}"))),
@@ -1795,19 +2597,166 @@ fn install_cli(_ctrl: &Rc<RefCell<Controller>>, _w: &MainWindow) {}
 // Search / write
 // ---------------------------------------------------------------------------
 
-fn start_search(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
-    let query = w.get_search_query().trim().to_string();
+/// Title-field search button. Uses the Title text as the query:
+///   - Movie kind (or anything not TV Show): search TMDB movies by title.
+///   - TV Show kind: search the Show's episodes whose episode title matches the
+///     Title text (optionally scoped to the Season field).
+fn start_title_search(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let is_tv = index_to_video_kind(w.get_video_kind_index()) == Some(VideoKind::TvShow);
+    if is_tv {
+        start_episode_title_search(ctrl, w);
+    } else {
+        start_movie_title_search(ctrl, w);
+    }
+}
+
+/// Movie search by the Title text.
+fn start_movie_title_search(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let query = w.get_title_text().trim().to_string();
     if query.is_empty() {
-        w.set_status(SharedString::from("Enter a title to search."));
+        w.set_status(SharedString::from("Enter a title to search for a movie."));
         return;
     }
     if !has_tmdb_credential(ctrl) {
         w.set_show_no_credential(true);
         return;
     }
-    w.set_status(SharedString::from(format!("Searching for “{query}”…")));
+    // A movie search replaces any TV tree with the flat results.
+    clear_tv_tree(ctrl, w);
+    w.set_status(SharedString::from(format!("Searching for movie “{query}”…")));
     let c = ctrl.borrow();
     let _ = c.worker.tx.send(Request::Search { query });
+}
+
+/// TV episode-title search: searches across ALL shows matching the Show field
+/// and ALL of their seasons and episodes (ignoring the Season/Episode fields),
+/// keeping episodes whose title matches the Title text, and presents the
+/// results in the Show → Season → Episode tree.
+fn start_episode_title_search(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let Some(show) = tv_show_name(w) else {
+        return;
+    };
+    if !has_tmdb_credential(ctrl) {
+        w.set_show_no_credential(true);
+        return;
+    }
+    let title = w.get_title_text().trim().to_string();
+    // Clear the flat list and any prior tree while the new one loads.
+    clear_tv_tree(ctrl, w);
+    w.set_matches(ModelRc::new(VecModel::from(Vec::<MatchItem>::new())));
+    w.set_selected_match_index(-1);
+    let status = if title.is_empty() {
+        format!("Listing all episodes of shows matching “{show}”…")
+    } else {
+        format!("Searching “{show}” episodes matching “{title}”…")
+    };
+    w.set_status(SharedString::from(status));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::SearchEpisodeTreeByTitle { show, title });
+}
+
+/// The show name for a TV search, taken from the Show field. Returns `None`
+/// (after setting a status) when empty.
+fn tv_show_name(w: &MainWindow) -> Option<String> {
+    let show = w.get_tv_show_text().trim().to_string();
+    if show.is_empty() {
+        w.set_status(SharedString::from("Enter a show name in the Show field to search."));
+        None
+    } else {
+        Some(show)
+    }
+}
+
+fn tv_season_value(w: &MainWindow) -> Option<u32> {
+    w.get_tv_season_text().trim().parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+fn tv_episode_value(w: &MainWindow) -> Option<u32> {
+    w.get_tv_episode_text().trim().parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+/// Show-field search button: a full show search. Builds the tree with every
+/// season of the resolved show.
+fn start_tv_search_show(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let Some(show) = tv_show_name(w) else {
+        return;
+    };
+    if !has_tmdb_credential(ctrl) {
+        w.set_show_no_credential(true);
+        return;
+    }
+    clear_tv_tree(ctrl, w);
+    w.set_matches(ModelRc::new(VecModel::from(Vec::<MatchItem>::new())));
+    w.set_selected_match_index(-1);
+    w.set_status(SharedString::from(format!("Searching shows matching “{show}”…")));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::SearchShows {
+        show,
+        season_filter: None,
+    });
+}
+
+/// Season-field search button: a show/season search. Builds the tree limited to
+/// the one entered season. Requires a season value.
+fn start_tv_search_season(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let Some(show) = tv_show_name(w) else {
+        return;
+    };
+    let Some(season) = tv_season_value(w) else {
+        w.set_status(SharedString::from("Enter a Season number to search by season."));
+        return;
+    };
+    if !has_tmdb_credential(ctrl) {
+        w.set_show_no_credential(true);
+        return;
+    }
+    clear_tv_tree(ctrl, w);
+    w.set_matches(ModelRc::new(VecModel::from(Vec::<MatchItem>::new())));
+    w.set_selected_match_index(-1);
+    w.set_status(SharedString::from(format!(
+        "Searching shows matching “{show}” (season {season})…"
+    )));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::SearchShows {
+        show,
+        season_filter: Some(season),
+    });
+}
+
+/// Episode-field search button: a show/season/episode lookup for the one
+/// episode, shown in the flat matches list. Requires season + episode values.
+fn start_tv_search_episode(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    let Some(show) = tv_show_name(w) else {
+        return;
+    };
+    let (Some(season), Some(episode)) = (tv_season_value(w), tv_episode_value(w)) else {
+        w.set_status(SharedString::from(
+            "Enter both a Season and an Episode number to search by episode.",
+        ));
+        return;
+    };
+    if !has_tmdb_credential(ctrl) {
+        w.set_show_no_credential(true);
+        return;
+    }
+    clear_tv_tree(ctrl, w);
+    w.set_status(SharedString::from(format!("Searching “{show}” S{season:02}E{episode:02}…")));
+    let c = ctrl.borrow();
+    let _ = c.worker.tx.send(Request::SearchTvEpisodes {
+        show,
+        season: Some(season),
+        episode: Some(episode),
+    });
+}
+
+/// Clear the TV Matches tree state and its rendered rows.
+fn clear_tv_tree(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
+    {
+        let mut c = ctrl.borrow_mut();
+        c.tv_tree = TvTree::default();
+        c.active_poster_show = None;
+    }
+    w.set_tv_tree_rows(ModelRc::new(VecModel::from(Vec::<TreeRow>::new())));
 }
 
 /// Whether a TMDB credential is available: a saved Bearer token or one of the
@@ -2142,6 +3091,88 @@ mod map_tests {
         // No columns or no items -> nothing.
         assert_eq!(visible_index_range(0, 1, 0, 20), None);
         assert_eq!(visible_index_range(0, 1, 4, 0), None);
+    }
+
+    fn node(season: u32, name: &str, episodes: &[(u32, &str)]) -> TreeSeasonNode {
+        TreeSeasonNode {
+            season_number: season,
+            name: name.to_string(),
+            episode_count: episodes.len() as u32,
+            expanded: false,
+            loaded: !episodes.is_empty(),
+            loading: false,
+            episodes: episodes.iter().map(|(n, t)| (*n, t.to_string())).collect(),
+        }
+    }
+
+    fn show_node(series_id: &str, name: &str, seasons: Vec<TreeSeasonNode>) -> TreeShowNode {
+        TreeShowNode {
+            series_id: series_id.to_string(),
+            show_name: name.to_string(),
+            year: None,
+            expanded: false,
+            seasons_loaded: !seasons.is_empty(),
+            seasons_loading: false,
+            seasons,
+        }
+    }
+
+    #[test]
+    fn locate_tree_row_maps_visible_rows() {
+        // One show expanded; season 1 expanded with 2 episodes; season 2 collapsed.
+        let mut s1 = node(1, "Season 1", &[(1, "Pilot"), (2, "Cat")]);
+        s1.expanded = true;
+        let s2 = node(2, "Season 2", &[]);
+        let mut show = show_node("42", "Breaking Bad", vec![s1, s2]);
+        show.expanded = true;
+        let tree = TvTree {
+            shows: vec![show],
+            season_filter: None,
+            selected: None,
+        };
+        // Row layout: 0=Show, 1=Season1, 2=Ep1, 3=Ep2, 4=Season2.
+        assert!(matches!(locate_tree_row(&tree, 0), Some(TreeHit::Show(0))));
+        assert!(matches!(locate_tree_row(&tree, 1), Some(TreeHit::Season(0, 1))));
+        assert!(matches!(
+            locate_tree_row(&tree, 2),
+            Some(TreeHit::Episode(ref sid, 1, 1)) if sid == "42"
+        ));
+        assert!(matches!(
+            locate_tree_row(&tree, 3),
+            Some(TreeHit::Episode(ref sid, 1, 2)) if sid == "42"
+        ));
+        assert!(matches!(locate_tree_row(&tree, 4), Some(TreeHit::Season(0, 2))));
+        assert!(locate_tree_row(&tree, 5).is_none());
+    }
+
+    #[test]
+    fn locate_tree_row_spans_multiple_shows() {
+        // Two shows: first collapsed, second expanded with one collapsed season.
+        let show0 = show_node("1", "Show A", vec![node(1, "Season 1", &[(1, "Ep")])]);
+        let mut show1 = show_node("2", "Show B", vec![node(1, "Season 1", &[(1, "Ep")])]);
+        show1.expanded = true;
+        let tree = TvTree {
+            shows: vec![show0, show1],
+            season_filter: None,
+            selected: None,
+        };
+        // Rows: 0=ShowA (collapsed), 1=ShowB, 2=ShowB/Season1 (collapsed).
+        assert!(matches!(locate_tree_row(&tree, 0), Some(TreeHit::Show(0))));
+        assert!(matches!(locate_tree_row(&tree, 1), Some(TreeHit::Show(1))));
+        assert!(matches!(locate_tree_row(&tree, 2), Some(TreeHit::Season(1, 1))));
+        assert!(locate_tree_row(&tree, 3).is_none());
+    }
+
+    #[test]
+    fn locate_tree_row_collapsed_show_has_only_root() {
+        let tree = TvTree {
+            shows: vec![show_node("42", "Show", vec![node(1, "Season 1", &[(1, "Pilot")])])],
+            season_filter: None,
+            selected: None,
+        };
+        assert!(matches!(locate_tree_row(&tree, 0), Some(TreeHit::Show(0))));
+        // With the show collapsed, no season/episode rows are visible.
+        assert!(locate_tree_row(&tree, 1).is_none());
     }
 }
 

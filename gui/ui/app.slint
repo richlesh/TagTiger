@@ -96,6 +96,23 @@ export global ClipCtx {
 export struct MatchItem {
     title: string,
     year: string,
+    // Episode name for TV hits enriched with a known season+episode; empty
+    // otherwise. When present, the row shows "Show — Episode".
+    episode: string,
+}
+
+// One visible row of the TV Matches tree (Show → Season → Episode), flattened
+// by the controller. `kind`: 0 = show, 1 = season, 2 = episode. Show/season
+// rows are expandable (triangle); episode rows are selectable (load details).
+export struct TreeRow {
+    kind: int,
+    label: string,
+    indent: int,
+    expandable: bool,
+    expanded: bool,
+    loading: bool,
+    selectable: bool,
+    selected: bool,
 }
 
 // One poster tile in the TMDB poster grid (or a placeholder while loading).
@@ -358,6 +375,42 @@ component IconButton inherits Rectangle {
     Tooltip { text: @markdown("\{root.tooltip}"); }
 }
 
+// A bordered magnifying-glass search button. Highlights in the system highlight
+// color on hover (the std Button shows no hover state in the native macOS
+// style). Reused by the top movie search row and the Show-field TV search.
+component SearchButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> tooltip: "Search TMDB";
+    callback clicked();
+
+    width: 34px;
+    height: 30px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: (root.enabled && stouch.has-hover) ? Theme.highlight : Theme.border;
+    background: !root.enabled
+        ? transparent
+        : (stouch.pressed
+            ? Theme.highlight.darker(0.2)
+            : (stouch.has-hover ? Theme.highlight : transparent));
+    Image {
+        source: @image-url("icons/magnifying-glass.svg");
+        colorize: !root.enabled
+            ? Theme.muted-text
+            : (stouch.has-hover ? Theme.highlight-text : Theme.text);
+        width: 20px;
+        height: 20px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    stouch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+    Tooltip { text: @markdown("\{root.tooltip}"); }
+}
+
 export component MainWindow inherits Window {
     title: "TagTiger";
     preferred-width: 1030px;
@@ -366,6 +419,13 @@ export component MainWindow inherits Window {
     min-height: 560px;
     icon: root.window-icon;
     background: Theme.window-bg;
+
+    // Global UI font size. The controller computes the pixel size from the
+    // Font Size setting (System/Small/Medium/Large) and sets `base-font-size`;
+    // binding it to the window's `default-font-size` scales every text element
+    // that doesn't set an explicit `font-size`.
+    in property <length> base-font-size: 13px;
+    default-font-size: root.base-font-size;
 
     // Theme: the controller sets `theme-dark` from the persisted Light/Dark
     // setting; we propagate it to the `Theme` global (our custom colors) and
@@ -435,9 +495,6 @@ export component MainWindow inherits Window {
     in property <bool> loading-details: false;
     in property <bool> writing: false;
 
-    // ---- Search --------------------------------------------------------
-    in-out property <string> search-query;
-
     // ---- Editable fields ----------------------------------------------
     in-out property <string> title-text;
     in-out property <string> year-text;
@@ -450,6 +507,13 @@ export component MainWindow inherits Window {
     in-out property <string> producers-text;
     in-out property <string> writers-text;
     in-out property <string> studio-text;
+
+    // ---- TV Show fields (shown only when Video Kind = "TV Show") --------
+    in-out property <string> tv-show-text;      // tvsh — show name
+    in-out property <string> tv-episode-id-text; // tven — episode id
+    in-out property <string> tv-season-text;    // tvsn — season number
+    in-out property <string> tv-episode-text;   // tves — episode number
+    in-out property <string> tv-network-text;   // tvnn — TV network
 
     // ---- Per-field locks ----------------------------------------------
     in-out property <bool> lock-title;
@@ -465,6 +529,11 @@ export component MainWindow inherits Window {
     in-out property <bool> lock-studio;
     in-out property <bool> lock-poster;
     in-out property <bool> lock-video-kind;
+    in-out property <bool> lock-tv-show;
+    in-out property <bool> lock-tv-episode-id;
+    in-out property <bool> lock-tv-season;
+    in-out property <bool> lock-tv-episode;
+    in-out property <bool> lock-tv-network;
 
     // ---- Dropdowns (string models; controller maps to core enums) ------
     // Index 0 is always "(none)".
@@ -488,6 +557,11 @@ export component MainWindow inherits Window {
     in property <[MatchItem]> matches;
     // Index of the selected match row (-1 = none), highlighted in the list.
     in property <int> selected-match-index: -1;
+
+    // ---- TV Matches tree (Show → Season → Episode) --------------------
+    // When non-empty, the Matches pane renders this hierarchical tree instead
+    // of the flat `matches` list. Rows are a flattened view of expanded nodes.
+    in property <[TreeRow]> tv-tree-rows;
 
     // ---- TMDB poster choices ------------------------------------------
     in property <[PosterItem]> posters;
@@ -513,6 +587,8 @@ export component MainWindow inherits Window {
     in-out property <string> settings-token;
     // Theme selector: 0 = Light, 1 = Dark (matches the Settings ComboBox model).
     in-out property <int> settings-theme-index: 1;
+    // Font size selector: 0 = System, 1 = Small, 2 = Medium, 3 = Large.
+    in-out property <int> settings-font-index: 0;
     in property <bool> show-no-credential: false;
     in property <bool> show-lightbox: false;
     in property <image> lightbox-image;
@@ -536,8 +612,13 @@ export component MainWindow inherits Window {
     callback open-license();
     callback install-cli();
     callback open-about();
-    callback do-search();
+    callback title-search();            // Title-field button: movie-by-title or TV-episode-by-title
+    callback search-tv();               // Show-field button: search TV episodes
+    callback search-tv-season();        // Season-field button: search show/season
+    callback search-tv-episode();       // Episode-field button: search show/season/episode
     callback select-match(int);          // index into `matches`
+    callback tree-toggle(int);           // expand/collapse a tree row
+    callback tree-select(int);           // select an episode tree row
     callback field-edited();             // any field changed (coalesced undo)
     callback field-commit();             // field lost focus / accepted
     callback video-kind-changed(int);
@@ -563,6 +644,7 @@ export component MainWindow inherits Window {
     callback settings-cancel();
     callback settings-save();
     callback theme-changed(int);         // 0 = Light, 1 = Dark (live apply)
+    callback font-size-changed(int);     // 0=System,1=Small,2=Medium,3=Large (live)
     callback no-cred-ok();
     callback no-cred-open-settings();
     callback lightbox-close();
@@ -593,7 +675,7 @@ export component MainWindow inherits Window {
                 title: "Search TMDB";
                 enabled: root.file-loaded && !root.writing;
                 shortcut: @keys(Control + F);
-                activated => { root.do-search(); }
+                activated => { root.title-search(); }
             }
             MenuSeparator {}
             // On macOS, Settings lives in the application menu (under About);
@@ -766,59 +848,6 @@ export component MainWindow inherits Window {
                         spacing: 6px;
                         alignment: start;
 
-                        // Search row.
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 8px;
-                            Text {
-                                text: "Search:";
-                                width: 190px;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
-                            }
-                            LineEdit {
-                                horizontal-stretch: 1;
-                                placeholder-text: "Movie title";
-                                text <=> root.search-query;
-                                accepted => { root.do-search(); }
-                            }
-                            // Search button: highlights in the system highlight
-                            // color on hover (the std Button shows no hover state
-                            // in the native macOS style), mirroring IconButton.
-                            // Disabled while a tag-write is in progress.
-                            Rectangle {
-                                property <bool> enabled: !root.writing;
-                                width: 34px;
-                                height: 30px;
-                                border-radius: 5px;
-                                border-width: 1px;
-                                border-color: (self.enabled && search-touch.has-hover) ? Theme.highlight : Theme.border;
-                                background: !self.enabled
-                                    ? transparent
-                                    : (search-touch.pressed
-                                        ? Theme.highlight.darker(0.2)
-                                        : (search-touch.has-hover ? Theme.highlight : transparent));
-                                Image {
-                                    source: @image-url("icons/magnifying-glass.svg");
-                                    colorize: !parent.enabled
-                                        ? Theme.muted-text
-                                        : (search-touch.has-hover ? Theme.highlight-text : Theme.text);
-                                    width: 20px;
-                                    height: 20px;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                                search-touch := TouchArea {
-                                    enabled: parent.enabled;
-                                    mouse-cursor: parent.enabled ? MouseCursor.pointer : MouseCursor.default;
-                                    clicked => { root.do-search(); }
-                                }
-                                Tooltip { text: @markdown("Search TMDB"); }
-                            }
-                        }
-
-                        Rectangle { height: 1px; background: Theme.hairline; }
-
                         // Fields + poster columns.
                         HorizontalBox {
                             padding: 0px;
@@ -832,12 +861,38 @@ export component MainWindow inherits Window {
 
                                 Text { text: "Fields"; font-size: 16px; font-weight: 700; }
 
-                                FieldRow {
-                                    label: "Title";
-                                    value <=> root.title-text;
-                                    locked <=> root.lock-title;
-                                    edited => { root.field-edited(); }
-                                    commit => { root.field-commit(); }
+                                // Title row with a search button to the RIGHT of
+                                // the input. The button searches TMDB using the
+                                // Title text: movies by title, or (when the kind
+                                // is TV Show) episodes of the Show whose episode
+                                // title matches.
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    padding: 0px;
+                                    Text {
+                                        text: "Title";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    TigerLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.title-text;
+                                        enabled: !root.lock-title;
+                                        edited => { root.field-edited(); }
+                                        accepted => { root.title-search(); }
+                                    }
+                                    SearchButton {
+                                        enabled: !root.writing;
+                                        tooltip: root.video-kind-index == 2
+                                            ? "Search episodes of the Show by title"
+                                            : "Search movies by title on TMDB";
+                                        clicked => { root.title-search(); }
+                                    }
+                                    CheckBox {
+                                        text: "Lock";
+                                        checked <=> root.lock-title;
+                                    }
                                 }
 
                                 // Video Kind + Lock + Fast-start.
@@ -971,6 +1026,110 @@ export component MainWindow inherits Window {
                                     locked <=> root.lock-overview;
                                     input-height: 90px;
                                     edited => { root.field-edited(); }
+                                }
+
+                                // ---- TV Show fields --------------------
+                                // Shown only when Video Kind = "TV Show"
+                                // (video-kind-options index 2). Placed at the
+                                // end of the Fields column, before the poster
+                                // choices below.
+                                // Show + a TV-episode search button. Mirrors the
+                                // FieldRow layout but inserts a magnifying glass
+                                // (searches TV episodes via the Show/Season/
+                                // Episode fields) before the Lock checkbox.
+                                if root.video-kind-index == 2: HorizontalBox {
+                                    spacing: 8px;
+                                    padding: 0px;
+                                    Text {
+                                        text: "Show";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    TigerLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.tv-show-text;
+                                        enabled: !root.lock-tv-show;
+                                        edited => { root.field-edited(); }
+                                        accepted => { root.search-tv(); }
+                                    }
+                                    SearchButton {
+                                        enabled: !root.writing;
+                                        tooltip: "Search this show on TMDB (all seasons)";
+                                        clicked => { root.search-tv(); }
+                                    }
+                                    CheckBox {
+                                        text: "Lock";
+                                        checked <=> root.lock-tv-show;
+                                    }
+                                }
+                                if root.video-kind-index == 2: FieldRow {
+                                    label: "Episode ID";
+                                    value <=> root.tv-episode-id-text;
+                                    locked <=> root.lock-tv-episode-id;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
+                                }
+                                // Season + a "search show/season" button.
+                                if root.video-kind-index == 2: HorizontalBox {
+                                    spacing: 8px;
+                                    padding: 0px;
+                                    Text {
+                                        text: "Season";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    TigerLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.tv-season-text;
+                                        enabled: !root.lock-tv-season;
+                                        edited => { root.field-edited(); }
+                                        accepted => { root.search-tv-season(); }
+                                    }
+                                    SearchButton {
+                                        enabled: !root.writing;
+                                        tooltip: "Search this show + season on TMDB";
+                                        clicked => { root.search-tv-season(); }
+                                    }
+                                    CheckBox {
+                                        text: "Lock";
+                                        checked <=> root.lock-tv-season;
+                                    }
+                                }
+                                // Episode + a "search show/season/episode" button.
+                                if root.video-kind-index == 2: HorizontalBox {
+                                    spacing: 8px;
+                                    padding: 0px;
+                                    Text {
+                                        text: "Episode";
+                                        width: 190px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    TigerLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.tv-episode-text;
+                                        enabled: !root.lock-tv-episode;
+                                        edited => { root.field-edited(); }
+                                        accepted => { root.search-tv-episode(); }
+                                    }
+                                    SearchButton {
+                                        enabled: !root.writing;
+                                        tooltip: "Search this show + season + episode on TMDB";
+                                        clicked => { root.search-tv-episode(); }
+                                    }
+                                    CheckBox {
+                                        text: "Lock";
+                                        checked <=> root.lock-tv-episode;
+                                    }
+                                }
+                                if root.video-kind-index == 2: FieldRow {
+                                    label: "TV Network";
+                                    value <=> root.tv-network-text;
+                                    locked <=> root.lock-tv-network;
+                                    edited => { root.field-edited(); }
+                                    commit => { root.field-commit(); }
                                 }
                             }
 
@@ -1128,15 +1287,76 @@ export component MainWindow inherits Window {
                 padding: 0px;
                 spacing: 6px;
                 Text { text: "Matches"; font-size: 16px; font-weight: 700; }
-                if root.matches.length == 0: Text {
-                    text: "No matches yet. Type a title and press search.";
+                // Empty state — only when neither a flat list nor a tree exists.
+                if root.matches.length == 0 && root.tv-tree-rows.length == 0: Text {
+                    text: "No matches yet. Search a movie, or a TV show by name.";
                     color: Theme.muted-text;
                     wrap: word-wrap;
                 }
-                ListView {
+                // TV tree (Show → Season → Episode). Takes precedence when present.
+                if root.tv-tree-rows.length > 0: ListView {
+                    vertical-stretch: 1;
+                    for t[i] in root.tv-tree-rows: Rectangle {
+                        // Scale the row height with the base font size so larger
+                        // font settings aren't cramped (min 30px at Small).
+                        height: max(30px, root.base-font-size * 2.1);
+                        background: t.selected
+                            ? Theme.highlight
+                            : (ttouch.has-hover && (t.expandable || t.selectable) ? Theme.hover-row : transparent);
+                        ttouch := TouchArea {
+                            enabled: !root.loading-details;
+                            mouse-cursor: (t.expandable || t.selectable) ? MouseCursor.pointer : MouseCursor.default;
+                            clicked => {
+                                if t.expandable {
+                                    root.tree-toggle(i);
+                                } else if t.selectable {
+                                    root.tree-select(i);
+                                }
+                            }
+                        }
+                        HorizontalBox {
+                            padding-left: 6px + t.indent * 16px;
+                            padding-right: 6px;
+                            spacing: 4px;
+                            // Expand/collapse triangle for show/season rows; a
+                            // fixed-width spacer keeps episode labels aligned.
+                            // The triangle glyphs (▸/▾) render low within their
+                            // line box, so a plain `vertical-alignment: center`
+                            // leaves them sitting on the text baseline. Center
+                            // the glyph on the row's text midline instead by
+                            // placing it in a fixed cell and nudging it up.
+                            if t.expandable: Rectangle {
+                                width: 22px;
+                                Text {
+                                    text: t.loading ? "…" : (t.expanded ? "▾" : "▸");
+                                    // ~100% larger swivel triangle than the
+                                    // default body text so it's an easy target.
+                                    font-size: 22px;
+                                    color: t.selected ? Theme.highlight-text : Theme.muted-text;
+                                    horizontal-alignment: center;
+                                    // Center on the text midline: the glyph's ink
+                                    // sits ~15% of the font size below the line
+                                    // box center, so lift it by that amount.
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2 - self.font-size * 0.15;
+                                }
+                            }
+                            if !t.expandable: Rectangle { width: 22px; }
+                            Text {
+                                text: t.label;
+                                color: t.selected ? Theme.highlight-text : Theme.text;
+                                font-weight: t.kind == 0 ? 700 : 400;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+                // Flat matches list (movies, or TV episode single-lookup hits).
+                if root.tv-tree-rows.length == 0: ListView {
                     vertical-stretch: 1;
                     for m[i] in root.matches: Rectangle {
-                        height: 34px;
+                        height: m.episode == "" ? 34px : 48px;
                         background: root.selected-match-index == i
                             ? Theme.highlight
                             : (touch.has-hover ? Theme.hover-row : transparent);
@@ -1147,11 +1367,30 @@ export component MainWindow inherits Window {
                         HorizontalBox {
                             padding-left: 6px;
                             padding-right: 6px;
-                            Text {
-                                text: m.year == "" ? m.title : m.title + " (" + m.year + ")";
-                                color: root.selected-match-index == i ? Theme.highlight-text : Theme.text;
-                                vertical-alignment: center;
-                                overflow: elide;
+                            // For a TV episode hit, show the show name on top and
+                            // the episode name (with year) beneath. For movies (or
+                            // TV hits without an episode name), a single line with
+                            // the title and year.
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 1px;
+                                Text {
+                                    text: m.episode == ""
+                                        ? (m.year == "" ? m.title : m.title + " (" + m.year + ")")
+                                        : m.title;
+                                    color: root.selected-match-index == i ? Theme.highlight-text : Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                if m.episode != "": Text {
+                                    text: m.year == ""
+                                        ? m.episode
+                                        : m.episode + " (" + m.year + ")";
+                                    color: root.selected-match-index == i ? Theme.highlight-text : Theme.muted-text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
                             }
                         }
                     }
@@ -1325,6 +1564,18 @@ export component MainWindow inherits Window {
                         current-index <=> root.settings-theme-index;
                         // Apply live so the user sees the change immediately.
                         selected(v) => { root.theme-changed(self.current-index); }
+                    }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "Font Size"; color: Theme.text; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: ["System", "Small", "Medium", "Large"];
+                        current-index <=> root.settings-font-index;
+                        // Apply live so the user sees the change immediately.
+                        selected(v) => { root.font-size-changed(self.current-index); }
                     }
                 }
                 Text { text: "TMDB Bearer Token"; color: Theme.text; }

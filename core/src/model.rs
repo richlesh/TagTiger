@@ -266,6 +266,10 @@ pub struct EpisodeInfo {
     pub episode_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
+    /// Optional user-supplied Episode ID (`tven`). When `None`, the tag layer
+    /// derives one from the season/episode (e.g. `1x02`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<String>,
 }
 
 /// A provider-specific identifier for a title (e.g. TMDB numeric id + kind).
@@ -274,6 +278,13 @@ pub struct ProviderId {
     pub provider: String,
     pub id: String,
     pub kind: MediaKind,
+    /// For TV episodes: which season/episode to fetch details for. Ignored for
+    /// movies and for show-level lookups. When both are `Some`, the provider
+    /// fetches that specific episode's title/overview/air date/stills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
 }
 
 /// A lightweight search hit shown to the user before fetching full details.
@@ -284,6 +295,11 @@ pub struct SearchResult {
     pub year: Option<i32>,
     pub overview: Option<String>,
     pub poster_thumb_url: Option<String>,
+    /// For TV hits enriched with a known season+episode: the episode's name,
+    /// shown alongside the show title in the Matches list. `None` for movies
+    /// and for TV searches without a specific episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_name: Option<String>,
 }
 
 /// A parsed query derived from a filename or user input.
@@ -295,6 +311,41 @@ pub struct MediaQuery {
     /// Present for episode lookups.
     pub season: Option<u32>,
     pub episode: Option<u32>,
+}
+
+/// A summary of one season of a TV show, used to build the Matches tree
+/// (Show → Season → Episode) without fetching every episode up front.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TvSeasonSummary {
+    pub season_number: u32,
+    /// Display name, e.g. "Season 1" or "Specials".
+    pub name: String,
+    pub episode_count: u32,
+}
+
+/// One matching episode within a filtered episode-title search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TvEpisodeHit {
+    pub number: u32,
+    pub name: String,
+}
+
+/// A season containing the episodes that matched a title search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TvSeasonMatch {
+    pub season_number: u32,
+    pub name: String,
+    pub episodes: Vec<TvEpisodeHit>,
+}
+
+/// A show (with its matching seasons/episodes) produced by a filtered
+/// episode-title search across all matching shows and all their seasons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TvShowMatch {
+    pub series_id: String,
+    pub show_name: String,
+    pub year: Option<i32>,
+    pub seasons: Vec<TvSeasonMatch>,
 }
 
 #[cfg(test)]

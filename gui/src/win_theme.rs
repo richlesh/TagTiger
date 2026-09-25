@@ -50,3 +50,37 @@ pub fn system_colors() -> Option<SystemColors> {
         accent,
     })
 }
+
+/// The Windows UI font size in logical pixels, read from the non-client metrics
+/// message font (`SPI_GETNONCLIENTMETRICS` → `lfMessageFont.lfHeight`). A
+/// negative `lfHeight` is the character height in logical units; we return its
+/// magnitude. Returns `None` if the query fails.
+pub fn system_font_size() -> Option<f32> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+
+    let mut ncm = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS,
+            ncm.cbSize,
+            Some(&mut ncm as *mut _ as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    let h = ncm.lfMessageFont.lfHeight;
+    let px = if h < 0 { (-h) as f32 } else { h as f32 };
+    if px > 0.0 {
+        Some(px)
+    } else {
+        None
+    }
+}

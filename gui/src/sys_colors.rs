@@ -63,3 +63,25 @@ pub fn system_colors() -> Option<SystemColors> {
         None
     }
 }
+
+/// The OS-defined default UI font size in points/pixels, used for the "System"
+/// Font Size setting. Falls back to a sensible desktop default (13.0) on
+/// platforms where it isn't read.
+pub fn system_font_size() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_theme::system_font_size().unwrap_or(13.0)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::win_theme::system_font_size().unwrap_or(13.0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_theme::system_font_size().unwrap_or(13.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        13.0
+    }
+}
