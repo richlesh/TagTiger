@@ -1,10 +1,15 @@
 # TagTiger
 
-Cross-platform MP4/M4V metadata tagger. Looks up movie (and, later, TV episode)
+Cross-platform MP4/M4V metadata tagger. Looks up movie **and TV episode**
 metadata and posters from TMDB and writes Apple/iTunes-style atoms directly into
 the file — title, release date, short/long description, genres, content rating,
 media kind, HD/4K definition, studio, the `iTunMOVI` cast/director/producer/
-screenwriter plist, cover art, and TV atoms.
+screenwriter plist, cover art, and TV atoms (show name, network, season,
+episode, and episode ID).
+
+For TV, Plex-style episode filenames (`Show - S01E02 - Title.mp4`) are parsed
+into show/season/episode, and you can search a show's episodes by title to get
+a Show → Season → Episode result tree.
 
 Written in Rust. No external command-line tools are required at runtime — MP4
 atom writing is done in-process via the pure-Rust `mp4ameta` crate. It ships as native binaries for Linux (x86-64 and ARM64), macOS (Apple Silicon only), and Windows (x86-64 and ARM64), without external runtime tagging tools.
@@ -69,15 +74,25 @@ Read Access Token is sent as a Bearer token and works with those endpoints.
 
 ```sh
 tagtiger search  "The Matrix (1999).mp4"      # parse name + list TMDB matches
+tagtiger search  "Breaking Bad" "Pilot"        # find episodes titled "Pilot" (Show > Season > Episode)
 tagtiger inspect movie.m4v                     # show existing tags (all fields)
 tagtiger tag     "The Matrix (1999).mp4" --id 603   # fetch + write tags (+poster)
 tagtiger tag     movie.m4v --id 603 --no-artwork       # write metadata only
+tagtiger tag     "Breaking Bad - S01E02.mp4" --id 1396 --tv  # write TV episode atoms
 ```
+
+`search` takes either one filename (parsed as a movie or, for Plex-style
+`SxxEyy` names, a TV episode) or two strings — a TV show name and an episode
+title — to list matching episodes as a Show → Season → Episode tree. Pass
+`--tv` to `tag` to write TV episode atoms; the season/episode are read from the
+Plex-style filename so the specific episode's title, air date, and stills are
+fetched.
 
 `inspect` prints the full set of tags read back from the file — title, release
 date, media kind, definition, rating, genres, studio, directors, cast,
-producers, screenwriters, summary, long description, and whether cover art is
-present. `tag` preserves the file's existing fast-start layout. 
+producers, screenwriters, summary, long description, whether cover art is
+present, and — for TV episodes — the show name, episode ID, season, episode,
+and network. `tag` preserves the file's existing fast-start layout.
 Definition atom is deduced from the video track's dimensions.
 
 ## Usage (GUI)
@@ -98,6 +113,12 @@ file onto the window; a **Fast-start** checkbox controls whether the file is
 saved web-optimized (`moov` before `mdat`) or with `moov` last. The
 window/dock/taskbar icon and, on macOS/Windows, the executable and installer
 icons are bundled.
+
+For TV, open a Plex-style episode file (`Show - S01E02 - Title.mp4`) or type a
+show name and episode title into the search box; matches are shown as a
+**Show → Season → Episode** tree, and picking an episode fills in the show name,
+network, season, episode, and episode ID alongside the episode's own title, air
+date, summary, and stills.
 
 > [!NOTE]
 > Dragging files from the file manager onto the
@@ -127,7 +148,7 @@ operations.
 | Studio        | `©pub` and `iTunMOVI` `studio`                |
 | Cast/crew     | `iTunMOVI` plist inside `----`/`com.apple.iTunes` (cast, directors, producers, screenwriters) |
 | Poster        | `covr` (JPEG/PNG)                             |
-| TV (later)    | `tvsh`, `tvnn`, `tvsn`, `tves`, `tven`        |
+| TV show       | `tvsh` (show), `tvnn` (network), `tvsn` (season), `tves` (episode), `tven` (episode ID) |
 
 ## Platform support & packaging
 
